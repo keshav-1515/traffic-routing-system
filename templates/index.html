@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>City Road Network — Graph Viewer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+
+<style>
+  html, body { margin: 0; height: 100%; font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
+  #map { position: absolute; top: 0; bottom: 0; width: 100%; }
+
+  #panel {
+    position: absolute; top: 12px; left: 12px; z-index: 1000;
+    background: rgba(20, 22, 26, 0.92); color: #eee;
+    padding: 14px 16px; border-radius: 10px; width: 260px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.35); font-size: 13px;
+  }
+  #panel h1 { font-size: 15px; margin: 0 0 8px 0; }
+  #panel .row { display: flex; justify-content: space-between; margin: 3px 0; }
+  #panel .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 11px; margin-top: 6px;
+  }
+  .badge.real { background: #1e6b3c; }
+  .badge.synthetic { background: #7a4b1e; }
+
+  .legend { margin-top: 10px; }
+  .legend .swatch { display:inline-block; width:12px; height:12px; border-radius:2px; margin-right:6px; }
+
+  #node-marker {
+    background: #3388ff; border-radius: 50%; width: 6px; height: 6px;
+  }
+</style>
+</head>
+<body>
+
+<div id="panel">
+  <h1>Road Network Graph</h1>
+  <div class="row"><span>Nodes</span><span id="node-count">–</span></div>
+  <div class="row"><span>Road segments</span><span id="edge-count">–</span></div>
+  <div id="source-badge" class="badge">loading…</div>
+
+  <div class="legend">
+    <div><span class="swatch" style="background:#2ecc71"></span>Low congestion</div>
+    <div><span class="swatch" style="background:#f39c12"></span>Medium congestion</div>
+    <div><span class="swatch" style="background:#e74c3c"></span>High congestion</div>
+  </div>
+</div>
+
+<div id="map"></div>
+
+<script>
+  // Map is centered using coordinates computed by Python (see index() in app.py)
+  const map = L.map('map').setView([{{ center_lat }}, {{ center_lng }}], 16);
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap contributors',
+    maxZoom: 19,
+  }).addTo(map);
+
+  function congestionColor(score) {
+    if (score < 0.4) return '#2ecc71';   // green
+    if (score < 0.7) return '#f39c12';   // yellow
+    return '#e74c3c';                    // red
+  }
+
+  // All the actual graph-building, enrichment, and scoring happens in Python
+  // (app.py). The frontend just requests the finished GeoJSON and draws it.
+  fetch('/api/graph')
+    .then(res => res.json())
+    .then(data => {
+      document.getElementById('node-count').textContent = data.node_count;
+      document.getElementById('edge-count').textContent = data.edge_count;
+
+      const badge = document.getElementById('source-badge');
+      if (data.using_synthetic) {
+        badge.textContent = 'Synthetic grid (offline mode)';
+        badge.classList.add('synthetic');
+      } else {
+        badge.textContent = 'Real OpenStreetMap data';
+        badge.classList.add('real');
+      }
+
+      // Draw road segments, colored by congestion_score computed in Python
+      L.geoJSON(data.edges, {
+        style: (feature) => ({
+          color: congestionColor(feature.properties.congestion_score),
+          weight: 4,
+          opacity: 0.85,
+        }),
+        onEachFeature: (feature, layer) => {
+          const p = feature.properties;
+          layer.bindPopup(
+            `<b>${p.highway}</b><br>` +
+            `Lanes: ${p.lanes}<br>` +
+            `Length: ${p.length_m} m<br>` +
+            `Free-flow time: ${p.free_flow_time_min} min<br>` +
+            `Capacity: ${p.capacity_veh_per_hr} veh/hr<br>` +
+            `Congestion score: ${p.congestion_score}`
+          );
+        }
+      }).addTo(map);
+
+      // Draw intersections as small circle markers
+      L.geoJSON(data.nodes, {
+        pointToLayer: (feature, latlng) =>
+          L.circleMarker(latlng, {
+            radius: 3,
+            fillColor: '#3388ff',
+            color: '#1b4f9c',
+            weight: 1,
+            fillOpacity: 0.9,
+          }),
+      }).addTo(map);
+    })
+    .catch(err => {
+      document.getElementById('source-badge').textContent = 'Failed to load graph';
+      console.error(err);
+    });
+</script>
+
+</body>
+</html>
