@@ -2,58 +2,385 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<title>City Road Network — Graph Viewer</title>
+<title>City Road Network — Traffic Control</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
 
 <style>
-  html, body { margin: 0; height: 100%; font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
+  :root {
+    --bg-panel: #12151b;
+    --bg-panel-raised: #1a1f28;
+    --bg-panel-inset: #0d1015;
+    --border: #262c38;
+    --border-soft: #1d222b;
+    --text: #e7eaee;
+    --text-muted: #8992a3;
+    --text-faint: #5c6577;
+    --accent: #4fc7ff;      /* interactive / selection */
+    --accent-dim: #234456;
+    --low: #2ecc71;
+    --med: #f5a623;
+    --high: #e6493f;
+    --danger: #ff5470;
+    --radius: 10px;
+    --mono: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    --sans: -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+
+  html, body { margin: 0; height: 100%; font-family: var(--sans); background: #05070a; }
   #map { position: absolute; top: 0; bottom: 0; width: 100%; }
 
-  #panel {
-    position: absolute; top: 12px; left: 12px; z-index: 1000;
-    background: rgba(20, 22, 26, 0.92); color: #eee;
-    padding: 14px 16px; border-radius: 10px; width: 260px;
-    box-shadow: 0 4px 14px rgba(0,0,0,0.35); font-size: 13px;
-  }
-  #panel h1 { font-size: 15px; margin: 0 0 8px 0; }
-  #panel .row { display: flex; justify-content: space-between; margin: 3px 0; }
-  #panel .badge {
-    display: inline-block; padding: 2px 8px; border-radius: 10px;
-    font-size: 11px; margin-top: 6px;
-  }
-  .badge.real { background: #1e6b3c; }
-  .badge.synthetic { background: #7a4b1e; }
+  button, input { font-family: inherit; }
+  *:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
-  .legend { margin-top: 10px; }
-  .legend .swatch { display:inline-block; width:12px; height:12px; border-radius:2px; margin-right:6px; }
-
-  #node-marker {
-    background: #3388ff; border-radius: 50%; width: 6px; height: 6px;
+  /* ---------------------------------------------------------------- */
+  /* Console shell                                                     */
+  /* ---------------------------------------------------------------- */
+  #console {
+    position: absolute; top: 12px; left: 12px; bottom: 12px; z-index: 1000;
+    width: min(320px, 90vw);
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: 0 12px 32px rgba(0,0,0,0.45);
+    color: var(--text);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+    transition: transform 0.18s ease;
   }
+  @media (prefers-reduced-motion: reduce) { #console { transition: none; } }
+  #console.collapsed { transform: translateX(calc(-100% - 12px)); }
+
+  #console-toggle {
+    position: absolute; top: 12px; left: calc(min(320px, 90vw) + 24px); z-index: 1000;
+    background: var(--bg-panel); border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; width: 30px; height: 30px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: left 0.18s ease;
+    font-size: 14px;
+  }
+  #console.collapsed ~ #console-toggle { left: 12px; }
+
+  .console-header {
+    padding: 14px 16px 12px; border-bottom: 1px solid var(--border-soft);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .console-header h1 { font-size: 14px; margin: 0; letter-spacing: 0.02em; }
+  .console-header .eyebrow {
+    display: block; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--text-faint); margin-bottom: 2px;
+  }
+  .live-dot {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--low);
+    box-shadow: 0 0 0 3px rgba(46,204,113,0.15);
+    animation: pulse 2.4s ease-in-out infinite;
+  }
+  @media (prefers-reduced-motion: reduce) { .live-dot { animation: none; } }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  /* Tabs */
+  .tabs {
+    display: flex; gap: 2px; padding: 8px 8px 0; border-bottom: 1px solid var(--border-soft);
+  }
+  .tab {
+    flex: 1; background: none; border: none; color: var(--text-muted);
+    font-size: 11px; letter-spacing: 0.03em; text-transform: uppercase;
+    padding: 9px 4px; cursor: pointer; border-radius: 6px 6px 0 0;
+    position: relative;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent); }
+  .tab.active::after {
+    content: ""; position: absolute; left: 8px; right: 8px; bottom: -1px; height: 2px;
+    background: var(--accent); border-radius: 2px;
+  }
+
+  .tab-panels { flex: 1; overflow-y: auto; }
+  .panel { display: none; padding: 16px; }
+  .panel.active { display: block; }
+
+  .section-label {
+    font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--text-faint); margin: 0 0 8px;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Network tab: load gauge + counts                                  */
+  /* ---------------------------------------------------------------- */
+  .gauge-wrap { display: flex; flex-direction: column; align-items: center; padding: 6px 0 14px; }
+  .gauge {
+    --pct: 0;
+    width: 168px; height: 84px; position: relative; overflow: hidden;
+  }
+  .gauge::before {
+    content: ""; position: absolute; inset: 0;
+    border-radius: 168px 168px 0 0;
+    background: conic-gradient(from 270deg at 50% 100%,
+      var(--low) 0deg, var(--low) 72deg,
+      var(--med) 72deg, var(--med) 126deg,
+      var(--high) 126deg, var(--high) 180deg);
+    -webkit-mask: radial-gradient(circle at 50% 100%, transparent 54px, #000 55px);
+            mask: radial-gradient(circle at 50% 100%, transparent 54px, #000 55px);
+  }
+  .gauge-needle {
+    position: absolute; left: 50%; bottom: 0; width: 2px; height: 70px;
+    background: var(--text); transform-origin: bottom center;
+    transform: rotate(calc(var(--pct) * 1.8deg - 90deg));
+    transition: transform 0.6s cubic-bezier(.22,1,.36,1);
+  }
+  @media (prefers-reduced-motion: reduce) { .gauge-needle { transition: none; } }
+  .gauge-needle::after {
+    content: ""; position: absolute; bottom: -4px; left: 50%; transform: translateX(-50%);
+    width: 8px; height: 8px; border-radius: 50%; background: var(--text);
+  }
+  .gauge-readout { text-align: center; margin-top: 6px; }
+  .gauge-readout .value { font-family: var(--mono); font-size: 26px; font-weight: 600; }
+  .gauge-readout .label { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-faint); }
+
+  .stat-row {
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding: 7px 0; border-bottom: 1px solid var(--border-soft); font-size: 12.5px;
+  }
+  .stat-row:last-of-type { border-bottom: none; }
+  .stat-row .k { color: var(--text-muted); }
+  .stat-row .v { font-family: var(--mono); }
+
+  .badge {
+    display: inline-block; padding: 3px 10px; border-radius: 20px;
+    font-size: 10.5px; margin-top: 10px; letter-spacing: 0.03em;
+    border: 1px solid transparent;
+  }
+  .badge.real { background: rgba(46,107,60,0.25); color: #6fe39a; border-color: rgba(111,227,154,0.3); }
+  .badge.synthetic { background: rgba(122,75,30,0.25); color: #f0ab5e; border-color: rgba(240,171,94,0.3); }
+
+  .legend { margin-top: 16px; }
+  .legend .row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-muted); padding: 3px 0; }
+  .legend .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }
+
+  /* ---------------------------------------------------------------- */
+  /* Control tab                                                       */
+  /* ---------------------------------------------------------------- */
+  .selected-box {
+    background: var(--bg-panel-inset); border: 1px solid var(--border-soft);
+    border-radius: 8px; padding: 12px; margin-bottom: 16px;
+  }
+  .selected-box .placeholder { color: var(--text-faint); font-size: 12.5px; }
+  .selected-box .road-name { font-size: 13px; font-weight: 600; }
+  .selected-box .road-meta { font-family: var(--mono); font-size: 11.5px; color: var(--text-muted); margin-top: 4px; }
+
+  .field { margin-bottom: 16px; }
+  .field-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+  .field-head .k { font-size: 11.5px; color: var(--text-muted); }
+  .field-head .v { font-family: var(--mono); font-size: 12px; color: var(--accent); }
+
+  input[type="range"] {
+    width: 100%; accent-color: var(--accent); background: transparent;
+  }
+
+  .action-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 4px; }
+  .action-btn {
+    background: var(--bg-panel-raised); border: 1px solid var(--border);
+    color: var(--text); border-radius: 8px; padding: 10px 8px; font-size: 12px;
+    cursor: pointer; text-align: left; line-height: 1.3;
+  }
+  .action-btn:hover { border-color: var(--accent-dim); }
+  .action-btn.armed { border-color: var(--accent); color: var(--accent); background: rgba(79,199,255,0.08); }
+  .action-btn .icon { display: block; font-size: 15px; margin-bottom: 4px; }
+  .action-btn.danger.armed { border-color: var(--danger); color: var(--danger); background: rgba(255,84,112,0.08); }
+
+  /* ---------------------------------------------------------------- */
+  /* Camera tab                                                        */
+  /* ---------------------------------------------------------------- */
+  .dropzone {
+    border: 1.5px dashed var(--border); border-radius: 8px; padding: 22px 12px;
+    text-align: center; color: var(--text-muted); font-size: 12px; cursor: pointer;
+    margin-bottom: 14px;
+  }
+  .dropzone:hover { border-color: var(--accent-dim); color: var(--text); }
+  .dropzone .icon { font-size: 20px; display: block; margin-bottom: 6px; }
+
+  .text-field {
+    width: 100%; box-sizing: border-box; background: var(--bg-panel-inset);
+    border: 1px solid var(--border); color: var(--text); border-radius: 7px;
+    padding: 9px 10px; font-size: 12.5px; margin-top: 6px;
+  }
+
+  .feed-preview {
+    aspect-ratio: 16 / 9; background: var(--bg-panel-inset); border: 1px solid var(--border-soft);
+    border-radius: 8px; display: flex; align-items: center; justify-content: center;
+    color: var(--text-faint); font-size: 11.5px; margin: 14px 0; flex-direction: column; gap: 6px;
+  }
+  .feed-preview .icon { font-size: 18px; opacity: 0.6; }
+
+  .metric-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .metric {
+    background: var(--bg-panel-inset); border: 1px solid var(--border-soft);
+    border-radius: 8px; padding: 10px;
+  }
+  .metric .v { font-family: var(--mono); font-size: 17px; }
+  .metric .k { font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-faint); margin-top: 2px; }
+
+  /* ---------------------------------------------------------------- */
+  /* Zones tab                                                         */
+  /* ---------------------------------------------------------------- */
+  .zone-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 0; border-bottom: 1px solid var(--border-soft);
+  }
+  .zone-row:last-of-type { border-bottom: none; }
+  .zone-row .zi { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+  .zone-row .zi .icon { font-size: 15px; width: 18px; text-align: center; }
+  .zone-row .zi .sub { display: block; font-size: 10.5px; color: var(--text-faint); font-weight: 400; }
+
+  .switch { position: relative; width: 36px; height: 20px; flex-shrink: 0; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .track {
+    position: absolute; inset: 0; background: var(--bg-panel-inset); border: 1px solid var(--border);
+    border-radius: 20px; cursor: pointer; transition: background 0.15s ease;
+  }
+  .switch .track::before {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px;
+    background: var(--text-muted); border-radius: 50%; transition: transform 0.15s ease, background 0.15s ease;
+  }
+  .switch input:checked + .track { background: var(--accent-dim); border-color: var(--accent); }
+  .switch input:checked + .track::before { transform: translateX(16px); background: var(--accent); }
+
+  .add-zone-btn {
+    width: 100%; margin-top: 14px; background: var(--bg-panel-raised); border: 1px dashed var(--border);
+    color: var(--text-muted); border-radius: 8px; padding: 10px; font-size: 12px; cursor: pointer;
+  }
+  .add-zone-btn:hover { color: var(--accent); border-color: var(--accent-dim); }
+
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 </style>
 </head>
 <body>
 
-<div id="panel">
-  <h1>Road Network Graph</h1>
-  <div class="row"><span>Nodes</span><span id="node-count">–</span></div>
-  <div class="row"><span>Road segments</span><span id="edge-count">–</span></div>
-  <div id="source-badge" class="badge">loading…</div>
+<div id="console">
+  <div class="console-header">
+    <div>
+      <span class="eyebrow">City Road Network</span>
+      <h1>Traffic Control</h1>
+    </div>
+    <span class="live-dot" title="Simulation live"></span>
+  </div>
 
-  <div class="legend">
-    <div><span class="swatch" style="background:#2ecc71"></span>Low congestion</div>
-    <div><span class="swatch" style="background:#f39c12"></span>Medium congestion</div>
-    <div><span class="swatch" style="background:#e74c3c"></span>High congestion</div>
+  <div class="tabs" role="tablist">
+    <button class="tab active" data-tab="network" role="tab" aria-selected="true">Network</button>
+    <button class="tab" data-tab="control" role="tab" aria-selected="false">Control</button>
+    <button class="tab" data-tab="camera" role="tab" aria-selected="false">Camera</button>
+    <button class="tab" data-tab="zones" role="tab" aria-selected="false">Zones</button>
+  </div>
+
+  <div class="tab-panels">
+
+    <!-- NETWORK ------------------------------------------------------ -->
+    <section class="panel active" data-panel="network">
+      <div class="gauge-wrap">
+        <div class="gauge" id="load-gauge">
+          <div class="gauge-needle" id="load-needle"></div>
+        </div>
+        <div class="gauge-readout">
+          <div class="value" id="load-value">–</div>
+          <div class="label">Avg. network load</div>
+        </div>
+      </div>
+
+      <div class="stat-row"><span class="k">Nodes</span><span class="v" id="node-count">–</span></div>
+      <div class="stat-row"><span class="k">Road segments</span><span class="v" id="edge-count">–</span></div>
+      <div id="source-badge" class="badge">loading…</div>
+
+      <div class="legend">
+        <div class="section-label" style="margin-top:14px;">Congestion legend</div>
+        <div class="row"><span class="swatch" style="background:#2ecc71"></span>Low congestion</div>
+        <div class="row"><span class="swatch" style="background:#f39c12"></span>Medium congestion</div>
+        <div class="row"><span class="swatch" style="background:#e74c3c"></span>High congestion</div>
+      </div>
+    </section>
+
+    <!-- CONTROL ------------------------------------------------------ -->
+    <section class="panel" data-panel="control">
+      <div class="section-label">Selected segment</div>
+      <div class="selected-box" id="selected-box">
+        <span class="placeholder">Click a road on the map to select it.</span>
+      </div>
+
+      <div class="field">
+        <div class="field-head"><span class="k">Traffic density</span><span class="v" id="density-value">50%</span></div>
+        <input type="range" id="density-slider" min="0" max="100" value="50" />
+      </div>
+
+      <div class="section-label">Simulate</div>
+      <div class="action-grid">
+        <button class="action-btn" data-arm="jam"><span class="icon">🚦</span>Traffic jam</button>
+        <button class="action-btn danger" data-arm="block"><span class="icon">🚧</span>Road block</button>
+        <button class="action-btn" data-arm="peak"><span class="icon">📈</span>Peak-hour surge</button>
+        <button class="action-btn" data-arm="clear"><span class="icon">↺</span>Reset segment</button>
+      </div>
+    </section>
+
+    <!-- CAMERA --------------------------------------------------------- -->
+    <section class="panel" data-panel="camera">
+      <div class="section-label">Assign video source</div>
+      <div class="dropzone" id="dropzone" tabindex="0" role="button">
+        <span class="icon">⬆</span>
+        Drop a traffic video here, or click to browse
+      </div>
+      <input class="text-field" type="text" placeholder="…or paste a live camera stream URL" />
+
+      <div class="section-label" style="margin-top: 16px;">Feed preview</div>
+      <div class="feed-preview">
+        <span class="icon">▣</span>
+        No feed connected
+      </div>
+
+      <div class="section-label">Detected (last frame)</div>
+      <div class="metric-grid">
+        <div class="metric"><div class="v">–</div><div class="k">Vehicles</div></div>
+        <div class="metric"><div class="v">–</div><div class="k">Avg. speed</div></div>
+        <div class="metric"><div class="v">–</div><div class="k">Density</div></div>
+        <div class="metric"><div class="v">–</div><div class="k">Congestion</div></div>
+      </div>
+    </section>
+
+    <!-- ZONES ----------------------------------------------------------- -->
+    <section class="panel" data-panel="zones">
+      <div class="section-label">Special zones</div>
+
+      <div class="zone-row">
+        <span class="zi"><span class="icon">🏥</span><span>Hospitals<span class="sub">Penalize through-traffic at peak</span></span></span>
+        <label class="switch"><input type="checkbox" checked /><span class="track"></span></label>
+      </div>
+      <div class="zone-row">
+        <span class="zi"><span class="icon">🏫</span><span>Schools<span class="sub">Penalize through-traffic at peak</span></span></span>
+        <label class="switch"><input type="checkbox" checked /><span class="track"></span></label>
+      </div>
+      <div class="zone-row">
+        <span class="zi"><span class="icon">🚨</span><span>Emergency zones<span class="sub">Always avoided by routing</span></span></span>
+        <label class="switch"><input type="checkbox" checked /><span class="track"></span></label>
+      </div>
+      <div class="zone-row">
+        <span class="zi"><span class="icon">⏱</span><span>Peak-hour mode<span class="sub">Applies zone penalties now</span></span></span>
+        <label class="switch"><input type="checkbox" /><span class="track"></span></label>
+      </div>
+
+      <button class="add-zone-btn">+ Draw a new zone on the map</button>
+    </section>
+
   </div>
 </div>
+
+<button id="console-toggle" title="Toggle panel" aria-label="Toggle control panel">‹</button>
 
 <div id="map"></div>
 
 <script>
+  // ------------------------------------------------------------------
   // Map is centered using coordinates computed by Python (see index() in app.py)
+  // ------------------------------------------------------------------
   const map = L.map('map').setView([{{ center_lat }}, {{ center_lng }}], 16);
 
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -67,8 +394,53 @@
     return '#e74c3c';                    // red
   }
 
-  // All the actual graph-building, enrichment, and scoring happens in Python
-  // (app.py). The frontend just requests the finished GeoJSON and draws it.
+  // ------------------------------------------------------------------
+  // Console UI: tabs, collapse toggle, selection readout, mock controls.
+  // Purely presentational — no simulation/backend logic is wired up yet.
+  // ------------------------------------------------------------------
+  const consoleEl = document.getElementById('console');
+  document.getElementById('console-toggle').addEventListener('click', () => {
+    consoleEl.classList.toggle('collapsed');
+  });
+
+  document.querySelectorAll('.tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach((t) => { t.classList.remove('active'); t.setAttribute('aria-selected', 'false'); });
+      document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'));
+      tab.classList.add('active');
+      tab.setAttribute('aria-selected', 'true');
+      document.querySelector(`.panel[data-panel="${tab.dataset.tab}"]`).classList.add('active');
+    });
+  });
+
+  const densitySlider = document.getElementById('density-slider');
+  const densityValue = document.getElementById('density-value');
+  densitySlider.addEventListener('input', () => {
+    densityValue.textContent = `${densitySlider.value}%`;
+  });
+
+  document.querySelectorAll('.action-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const alreadyArmed = btn.classList.contains('armed');
+      btn.parentElement.querySelectorAll('.action-btn').forEach((b) => b.classList.remove('armed'));
+      if (!alreadyArmed) btn.classList.add('armed');
+    });
+  });
+
+  function updateSelectedBox(props) {
+    const box = document.getElementById('selected-box');
+    box.innerHTML = `
+      <div class="road-name">${props.highway}</div>
+      <div class="road-meta">Lanes ${props.lanes} · ${props.length_m} m · ${props.free_flow_time_min} min free-flow</div>
+      <div class="road-meta">Congestion score ${props.congestion_score}</div>
+    `;
+  }
+
+  // ------------------------------------------------------------------
+  // All the actual graph-building, enrichment, and scoring happens in
+  // Python (virtual_world.py). The frontend just requests the finished
+  // GeoJSON and draws it.
+  // ------------------------------------------------------------------
   fetch('/api/graph')
     .then(res => res.json())
     .then(data => {
@@ -82,6 +454,17 @@
       } else {
         badge.textContent = 'Real OpenStreetMap data';
         badge.classList.add('real');
+      }
+
+      // Drive the network-load gauge from the same congestion scores
+      // used to color the map — purely a different view of existing data.
+      const scores = data.edges.features
+        .map(f => f.properties.congestion_score)
+        .filter(s => typeof s === 'number');
+      if (scores.length) {
+        const avgPct = Math.round((scores.reduce((a, b) => a + b, 0) / scores.length) * 100);
+        document.getElementById('load-gauge').style.setProperty('--pct', avgPct);
+        document.getElementById('load-value').textContent = `${avgPct}%`;
       }
 
       // Draw road segments, colored by congestion_score computed in Python
@@ -101,6 +484,13 @@
             `Capacity: ${p.capacity_veh_per_hr} veh/hr<br>` +
             `Congestion score: ${p.congestion_score}`
           );
+          // Mirror the same info into the Control tab's selection readout
+          // and switch to that tab so the click feels like "selecting" the
+          // road for the (not-yet-wired) density/jam/roadblock controls.
+          layer.on('click', () => {
+            updateSelectedBox(p);
+            document.querySelector('.tab[data-tab="control"]').click();
+          });
         }
       }).addTo(map);
 
