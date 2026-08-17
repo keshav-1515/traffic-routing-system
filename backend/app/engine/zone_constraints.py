@@ -1,14 +1,32 @@
 import networkx as nx
 
-class ZoneConstraintManager:
-    def __init__(self, graph: nx.MultiDiGraph):
-        self.graph = graph
 
-    def apply_soft_penalty(self, u: int, v: int, key: int, zone_type: str):
-        multipliers = {"school": 3.0, "hospital": 2.5, "residential": 2.0}
-        penalty = multipliers.get(zone_type, 1.5)
-        current_time = self.graph[u][v][key].get('travel_time', 10.0)
-        self.graph[u][v][key]['travel_time'] = current_time * penalty
+class ZoneConstraintEngine:
 
-    def apply_hard_constraint(self, u: int, v: int, key: int):
-        self.graph[u][v][key]['travel_time'] = float('inf')
+  def __init__(self):
+    self.penalties = {
+        "school": 3.0,
+        "residential": 2.0,
+        "hospital": 2.5,
+    }
+
+  def apply_penalty(
+      self,
+      graph: nx.MultiDiGraph,
+      u: int,
+      v: int,
+      key: int,
+      zone_type: str = "school",
+      penalty_factor: float = None,
+  ):
+    """Applies a multiplicative travel-time penalty to roads passing through sensitive zones."""
+    factor = penalty_factor or self.penalties.get(zone_type, 1.5)
+
+    if graph.has_edge(u, v, key):
+      edge_data = graph[u][v][key]
+      current_time = edge_data.get("travel_time", edge_data.get("length", 100.0) / 10.0)
+      edge_data["travel_time"] = current_time * factor
+      edge_data["zone_type"] = zone_type
+      edge_data["penalty_factor"] = factor
+      return edge_data["travel_time"]
+    return None
