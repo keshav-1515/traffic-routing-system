@@ -2,124 +2,589 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<title>City Road Network — Graph Viewer</title>
+<title>Traffic Control — Live City Grid</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
 
 <style>
-  html, body { margin: 0; height: 100%; font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
-  #map { position: absolute; top: 0; bottom: 0; width: 100%; }
-
-  #panel {
-    position: absolute; top: 12px; left: 12px; z-index: 1000;
-    background: rgba(20, 22, 26, 0.92); color: #eee;
-    padding: 14px 16px; border-radius: 10px; width: 260px;
-    box-shadow: 0 4px 14px rgba(0,0,0,0.35); font-size: 13px;
+  :root {
+    --ink:        #0b0d10;
+    --panel:      #12151a;
+    --panel-2:    #171b21;
+    --line:       #262b33;
+    --text:       #d8dee6;
+    --text-dim:   #7d8794;
+    --amber:      #f2a736;
+    --amber-dim:  #8a611f;
+    --signal-go:      #2ecc71;
+    --signal-caution: #f2a736;
+    --signal-stop:    #e0483f;
+    --accent:     #4fd1c5;
+    --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, Menlo, monospace;
+    --sans: "Inter", -apple-system, "Segoe UI", Roboto, sans-serif;
   }
-  #panel h1 { font-size: 15px; margin: 0 0 8px 0; }
-  #panel .row { display: flex; justify-content: space-between; margin: 3px 0; }
-  #panel .badge {
-    display: inline-block; padding: 2px 8px; border-radius: 10px;
-    font-size: 11px; margin-top: 6px;
-  }
-  .badge.real { background: #1e6b3c; }
-  .badge.synthetic { background: #7a4b1e; }
 
-  .legend { margin-top: 10px; }
-  .legend .swatch { display:inline-block; width:12px; height:12px; border-radius:2px; margin-right:6px; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; font-family: var(--sans); background: var(--ink); }
+  #map { position: absolute; inset: 0; filter: saturate(0.75) brightness(0.85); }
 
-  #node-marker {
-    background: #3388ff; border-radius: 50%; width: 6px; height: 6px;
+  /* ---------- Top status bar ---------- */
+  #topbar {
+    position: absolute; top: 0; left: 0; right: 0; height: 46px; z-index: 1100;
+    background: var(--panel); border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; padding: 0 16px; gap: 18px;
+    font-family: var(--mono); font-size: 12px; color: var(--text-dim);
   }
+  #topbar .title {
+    color: var(--text); font-size: 13px; font-weight: 600; letter-spacing: 0.04em;
+    text-transform: uppercase; margin-right: auto; display: flex; align-items: center; gap: 8px;
+  }
+  #topbar .title .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--signal-go); box-shadow: 0 0 6px var(--signal-go); }
+  #topbar .stat span:first-child { color: var(--text-dim); }
+  #topbar .stat b { color: var(--text); font-weight: 600; }
+  #peak-toggle {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase;
+    background: transparent; border: 1px solid var(--amber-dim); color: var(--amber);
+    padding: 5px 12px; border-radius: 3px; cursor: pointer; transition: all .15s;
+  }
+  #peak-toggle.active { background: var(--amber); color: #1a1300; border-color: var(--amber); }
+
+  /* ---------- Side console ---------- */
+  #console {
+    position: absolute; top: 56px; left: 12px; bottom: 12px; width: 300px; z-index: 1000;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    color: var(--text); font-size: 12.5px; display: flex; flex-direction: column;
+    overflow: hidden; box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  }
+  #tabs { display: flex; border-bottom: 1px solid var(--line); flex-shrink: 0; }
+  #tabs button {
+    flex: 1; background: none; border: none; color: var(--text-dim); font-family: var(--mono);
+    font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; padding: 10px 4px;
+    cursor: pointer; border-bottom: 2px solid transparent;
+  }
+  #tabs button.active { color: var(--accent); border-bottom-color: var(--accent); background: var(--panel-2); }
+  .pane { display: none; padding: 14px; overflow-y: auto; flex: 1; }
+  .pane.active { display: block; }
+
+  .section-label {
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--text-dim); margin: 14px 0 6px; display: flex; justify-content: space-between;
+  }
+  .section-label:first-child { margin-top: 0; }
+  .row { display: flex; justify-content: space-between; margin: 4px 0; align-items: center; }
+  .row .k { color: var(--text-dim); }
+  .row .v { font-family: var(--mono); color: var(--text); }
+
+  .legend-item { display: flex; align-items: center; gap: 7px; margin: 5px 0; color: var(--text-dim); }
+  .swatch { width: 11px; height: 11px; border-radius: 2px; flex-shrink: 0; }
+  .swatch.line { height: 3px; border-radius: 2px; }
+
+  .hint { color: var(--text-dim); font-size: 11.5px; line-height: 1.5; margin: 6px 0 12px; }
+
+  button.btn {
+    width: 100%; font-family: var(--mono); font-size: 11px; letter-spacing: 0.03em;
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+    padding: 8px 10px; border-radius: 4px; cursor: pointer; margin-top: 6px; transition: all .12s;
+  }
+  button.btn:hover { border-color: var(--accent); color: var(--accent); }
+  button.btn.primary { background: var(--accent); color: #072522; border-color: var(--accent); font-weight: 600; }
+  button.btn.primary:hover { filter: brightness(1.1); color: #072522; }
+  button.btn.danger { border-color: var(--signal-stop); color: var(--signal-stop); }
+  button.btn.danger:hover { background: var(--signal-stop); color: #1a0605; }
+  button.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.btn.small { width: auto; padding: 5px 9px; margin-top: 0; }
+  .btn-row { display: flex; gap: 6px; }
+  .btn-row .btn { flex: 1; }
+
+  input[type=number], input[type=text], select {
+    width: 100%; background: var(--ink); border: 1px solid var(--line); color: var(--text);
+    font-family: var(--mono); font-size: 12px; padding: 6px 8px; border-radius: 4px; margin-top: 4px;
+  }
+  input[type=range] { width: 100%; margin-top: 6px; accent-color: var(--accent); }
+  label.field { display: block; font-size: 11px; color: var(--text-dim); margin-top: 10px; }
+
+  #selected-edge-box {
+    border: 1px dashed var(--line); border-radius: 6px; padding: 10px; margin-top: 8px;
+  }
+  #selected-edge-box.empty { color: var(--text-dim); font-style: italic; text-align: center; padding: 18px 8px; }
+
+  /* ---------- Map decorations ---------- */
+  .zone-icon {
+    width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center;
+    justify-content: center; font-size: 11px; border: 2px solid #fff; box-shadow: 0 0 6px rgba(0,0,0,.6);
+  }
+  .zone-icon.hospital { background: #e0483f; }
+  .zone-icon.school { background: #4fd1c5; }
+  .zone-icon.emergency { background: #f2a736; }
+
+  .vehicle-marker { border-radius: 50%; border: 1.5px solid rgba(255,255,255,0.85); box-shadow: 0 0 4px rgba(0,0,0,.6); }
+
+  #toast {
+    position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 1200;
+    background: var(--panel); border: 1px solid var(--line); color: var(--text); font-family: var(--mono);
+    font-size: 12px; padding: 8px 16px; border-radius: 20px; opacity: 0; transition: opacity .25s;
+    pointer-events: none; box-shadow: 0 4px 14px rgba(0,0,0,.4);
+  }
+  #toast.show { opacity: 1; }
+
+  .leaflet-popup-content-wrapper { background: var(--panel); color: var(--text); border-radius: 6px; }
+  .leaflet-popup-tip { background: var(--panel); }
+  .leaflet-popup-content { font-family: var(--sans); font-size: 12.5px; }
+  .leaflet-popup-content b { color: var(--accent); }
 </style>
 </head>
 <body>
 
-<div id="panel">
-  <h1>Road Network Graph</h1>
-  <div class="row"><span>Nodes</span><span id="node-count">–</span></div>
-  <div class="row"><span>Road segments</span><span id="edge-count">–</span></div>
-  <div id="source-badge" class="badge">loading…</div>
+<div id="topbar">
+  <div class="title"><span class="dot" id="status-dot"></span> Traffic Control — Live Grid</div>
+  <div class="stat"><span>Source&nbsp;</span><b id="source-label">–</b></div>
+  <div class="stat"><span>Nodes&nbsp;</span><b id="node-count">–</b></div>
+  <div class="stat"><span>Segments&nbsp;</span><b id="edge-count">–</b></div>
+  <button id="peak-toggle">Peak Hour: Off</button>
+</div>
 
-  <div class="legend">
-    <div><span class="swatch" style="background:#2ecc71"></span>Low congestion</div>
-    <div><span class="swatch" style="background:#f39c12"></span>Medium congestion</div>
-    <div><span class="swatch" style="background:#e74c3c"></span>High congestion</div>
+<div id="console">
+  <div id="tabs">
+    <button class="tab-btn active" data-pane="overview">Overview</button>
+    <button class="tab-btn" data-pane="control">Road Control</button>
+    <button class="tab-btn" data-pane="route">Route</button>
+    <button class="tab-btn" data-pane="sim">Vehicles</button>
+  </div>
+
+  <!-- OVERVIEW -->
+  <div class="pane active" id="pane-overview">
+    <div class="section-label">Congestion legend</div>
+    <div class="legend-item"><span class="swatch line" style="background:var(--signal-go)"></span>Free flow (low)</div>
+    <div class="legend-item"><span class="swatch line" style="background:var(--signal-caution)"></span>Moderate</div>
+    <div class="legend-item"><span class="swatch line" style="background:var(--signal-stop)"></span>Heavy / gridlock</div>
+    <div class="legend-item"><span class="swatch line" style="background:#555; border-top: 2px dashed #888"></span>Blocked road</div>
+
+    <div class="section-label">Special zones</div>
+    <div class="legend-item"><span class="zone-icon hospital" style="width:14px;height:14px;font-size:8px;">H</span>Hospital zone</div>
+    <div class="legend-item"><span class="zone-icon school" style="width:14px;height:14px;font-size:8px;">S</span>School zone</div>
+    <div class="hint">During Peak Hour, routes are penalized for passing through hospital/school zones so through-traffic prefers alternatives.</div>
+
+    <div class="section-label">City state</div>
+    <div class="row"><span class="k">Data source</span><span class="v" id="ov-source">–</span></div>
+    <div class="row"><span class="k">Peak hour</span><span class="v" id="ov-peak">Off</span></div>
+    <div class="row"><span class="k">Simulated vehicles</span><span class="v" id="ov-vehicles">0</span></div>
+
+    <div class="section-label">Reset</div>
+    <button class="btn danger" id="btn-scenario-reset">Reset congestion &amp; blocks</button>
+  </div>
+
+  <!-- ROAD CONTROL -->
+  <div class="pane" id="pane-control">
+    <div class="hint">Click any road on the map to select it, then adjust its state below.</div>
+    <div class="section-label">Selected road</div>
+    <div id="selected-edge-box" class="empty">No road selected</div>
+
+    <div class="section-label" style="margin-top:16px;">Traffic camera upload</div>
+    <div class="hint">Upload a short clip of the selected road. Vehicle motion is analyzed with OpenCV to estimate a live congestion score.</div>
+    <input type="file" id="video-input" accept="video/*" disabled />
+    <button class="btn primary" id="btn-analyze-video" disabled>Analyze &amp; apply</button>
+    <div id="video-status" class="hint"></div>
+  </div>
+
+  <!-- ROUTE FINDER -->
+  <div class="pane" id="pane-route">
+    <div class="hint">Click a start node, then an end node on the map.</div>
+    <div class="row"><span class="k">Start</span><span class="v" id="route-source">–</span></div>
+    <div class="row"><span class="k">End</span><span class="v" id="route-target">–</span></div>
+    <label class="field">Optimize for
+      <select id="route-by">
+        <option value="time">Travel time (congestion-aware)</option>
+        <option value="distance">Shortest distance</option>
+      </select>
+    </label>
+    <div class="btn-row" style="margin-top:10px;">
+      <button class="btn primary" id="btn-find-route">Find route</button>
+      <button class="btn" id="btn-clear-route">Clear</button>
+    </div>
+    <div id="route-result" class="section-label" style="display:none;">Result</div>
+    <div class="row" id="route-dist-row" style="display:none;"><span class="k">Distance</span><span class="v" id="route-dist">–</span></div>
+    <div class="row" id="route-time-row" style="display:none;"><span class="k">Est. time</span><span class="v" id="route-time">–</span></div>
+  </div>
+
+  <!-- VEHICLE SIMULATION -->
+  <div class="pane" id="pane-sim">
+    <div class="hint">Spawn vehicles with random origins/destinations. They drive congestion-aware routes and re-route live as conditions change.</div>
+    <label class="field">Vehicles to spawn
+      <input type="number" id="spawn-count" value="15" min="1" max="200" />
+    </label>
+    <button class="btn primary" id="btn-spawn">Spawn vehicles</button>
+
+    <div class="section-label" style="margin-top:16px;">Simulation clock</div>
+    <div class="btn-row">
+      <button class="btn" id="btn-sim-start">Start</button>
+      <button class="btn" id="btn-sim-stop" disabled>Stop</button>
+    </div>
+    <button class="btn danger" id="btn-sim-reset">Reset vehicles</button>
+
+    <div class="section-label">Status</div>
+    <div class="row"><span class="k">Tick</span><span class="v" id="sim-tick">0</span></div>
+    <div class="row"><span class="k">Active</span><span class="v" id="sim-active">0</span></div>
+    <div class="row"><span class="k">Arrived</span><span class="v" id="sim-arrived">0</span></div>
   </div>
 </div>
 
+<div id="toast"></div>
 <div id="map"></div>
 
 <script>
-  // Map is centered using coordinates computed by Python (see index() in app.py)
-  const map = L.map('map').setView([{{ center_lat }}, {{ center_lng }}], 16);
+// ===========================================================================
+// All graph-building, routing, congestion, zone policy and vehicle physics
+// happen in Python (virtual_world.py). This file only renders what the
+// server sends and posts back the admin's actions.
+// ===========================================================================
 
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    attribution: '&copy; OpenStreetMap contributors',
-    maxZoom: 19,
+const map = L.map('map', { zoomControl: false }).setView([{{ center_lat }}, {{ center_lng }}], 16);
+L.control.zoom({ position: 'bottomright' }).addTo(map);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; OpenStreetMap contributors',
+  maxZoom: 19,
+}).addTo(map);
+
+let edgeLayer = null;
+let nodeLayer = null;
+let zoneLayer = L.layerGroup().addTo(map);
+let routeLayer = L.layerGroup().addTo(map);
+let vehicleLayer = L.layerGroup().addTo(map);
+let vehicleMarkers = {};
+
+let selectedEdge = null;      // {u, v}
+let routeSource = null;       // node id
+let routeTarget = null;       // node id
+let peakHour = false;
+let simTimer = null;
+
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => el.classList.remove('show'), 2600);
+}
+
+function congestionColor(score, blocked) {
+  if (blocked) return '#555';
+  if (score < 0.4) return getVar('--signal-go');
+  if (score < 0.7) return getVar('--signal-caution');
+  return getVar('--signal-stop');
+}
+function getVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+// ---------------------------------------------------------------------
+// Tabs
+// ---------------------------------------------------------------------
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('pane-' + btn.dataset.pane).classList.add('active');
+  });
+});
+
+// ---------------------------------------------------------------------
+// Load / redraw the graph
+// ---------------------------------------------------------------------
+function loadGraph() {
+  return fetch('/api/graph').then(res => res.json()).then(renderGraph);
+}
+
+function renderGraph(data) {
+  document.getElementById('node-count').textContent = data.node_count;
+  document.getElementById('edge-count').textContent = data.edge_count;
+  document.getElementById('source-label').textContent = data.using_synthetic ? 'Synthetic grid' : 'OpenStreetMap';
+  document.getElementById('ov-source').textContent = data.using_synthetic ? 'Synthetic (offline demo)' : 'Real OSM road network';
+
+  peakHour = data.peak_hour;
+  updatePeakUI();
+
+  if (edgeLayer) map.removeLayer(edgeLayer);
+  if (nodeLayer) map.removeLayer(nodeLayer);
+  zoneLayer.clearLayers();
+
+  edgeLayer = L.geoJSON(data.edges, {
+    style: (f) => ({
+      color: congestionColor(f.properties.congestion_score, f.properties.blocked),
+      weight: f.properties.blocked ? 3 : 4,
+      opacity: 0.9,
+      dashArray: f.properties.blocked ? '2 6' : null,
+    }),
+    onEachFeature: (feature, layer) => {
+      layer.on('click', (e) => {
+        L.DomEvent.stopPropagation(e);
+        selectEdge(feature.properties, layer);
+      });
+      layer.bindTooltip(edgeTooltip(feature.properties), { sticky: true });
+    }
   }).addTo(map);
 
-  function congestionColor(score) {
-    if (score < 0.4) return '#2ecc71';   // green
-    if (score < 0.7) return '#f39c12';   // yellow
-    return '#e74c3c';                    // red
-  }
+  nodeLayer = L.geoJSON(data.nodes, {
+    pointToLayer: (feature, latlng) => L.circleMarker(latlng, {
+      radius: 3, fillColor: '#3388ff', color: '#1b4f9c', weight: 1, fillOpacity: 0.9,
+    }).on('click', (e) => {
+      L.DomEvent.stopPropagation(e);
+      handleNodeClick(feature.properties.id, latlng);
+    }),
+  }).addTo(map);
 
-  // All the actual graph-building, enrichment, and scoring happens in Python
-  // (app.py). The frontend just requests the finished GeoJSON and draws it.
-  fetch('/api/graph')
-    .then(res => res.json())
-    .then(data => {
-      document.getElementById('node-count').textContent = data.node_count;
-      document.getElementById('edge-count').textContent = data.edge_count;
-
-      const badge = document.getElementById('source-badge');
-      if (data.using_synthetic) {
-        badge.textContent = 'Synthetic grid (offline mode)';
-        badge.classList.add('synthetic');
-      } else {
-        badge.textContent = 'Real OpenStreetMap data';
-        badge.classList.add('real');
-      }
-
-      // Draw road segments, colored by congestion_score computed in Python
-      L.geoJSON(data.edges, {
-        style: (feature) => ({
-          color: congestionColor(feature.properties.congestion_score),
-          weight: 4,
-          opacity: 0.85,
-        }),
-        onEachFeature: (feature, layer) => {
-          const p = feature.properties;
-          layer.bindPopup(
-            `<b>${p.highway}</b><br>` +
-            `Lanes: ${p.lanes}<br>` +
-            `Length: ${p.length_m} m<br>` +
-            `Free-flow time: ${p.free_flow_time_min} min<br>` +
-            `Capacity: ${p.capacity_veh_per_hr} veh/hr<br>` +
-            `Congestion score: ${p.congestion_score}`
-          );
-        }
-      }).addTo(map);
-
-      // Draw intersections as small circle markers
-      L.geoJSON(data.nodes, {
-        pointToLayer: (feature, latlng) =>
-          L.circleMarker(latlng, {
-            radius: 3,
-            fillColor: '#3388ff',
-            color: '#1b4f9c',
-            weight: 1,
-            fillOpacity: 0.9,
-          }),
-      }).addTo(map);
-    })
-    .catch(err => {
-      document.getElementById('source-badge').textContent = 'Failed to load graph';
-      console.error(err);
+  // Zone markers at the midpoint of tagged roads.
+  data.edges.features.forEach(f => {
+    if (!f.properties.zone_type) return;
+    const coords = f.geometry.coordinates;
+    const mid = coords[Math.floor(coords.length / 2)];
+    const label = f.properties.zone_type === 'hospital' ? 'H' : f.properties.zone_type === 'school' ? 'S' : '!';
+    const icon = L.divIcon({
+      className: '',
+      html: `<div class="zone-icon ${f.properties.zone_type}">${label}</div>`,
+      iconSize: [20, 20], iconAnchor: [10, 10],
     });
+    L.marker([mid[1], mid[0]], { icon }).addTo(zoneLayer)
+      .bindTooltip(`${f.properties.zone_type} zone`, { direction: 'top' });
+  });
+
+  // Refresh the currently selected edge's panel with live data, if any.
+  if (selectedEdge) {
+    const match = data.edges.features.find(f =>
+      (f.properties.u === selectedEdge.u && f.properties.v === selectedEdge.v) ||
+      (f.properties.u === selectedEdge.v && f.properties.v === selectedEdge.u));
+    if (match) renderSelectedEdgePanel(match.properties);
+  }
+}
+
+function edgeTooltip(p) {
+  return `<b>${p.highway}</b> · ${p.lanes} lane(s)<br>` +
+         `${p.length_m} m · congestion ${p.congestion_score}` +
+         (p.blocked ? ' · <b>BLOCKED</b>' : '') +
+         (p.zone_type ? ` · ${p.zone_type} zone` : '');
+}
+
+// ---------------------------------------------------------------------
+// Road selection + admin controls
+// ---------------------------------------------------------------------
+function selectEdge(props, layer) {
+  selectedEdge = { u: props.u, v: props.v };
+  document.querySelector('.tab-btn[data-pane="control"]').click();
+  renderSelectedEdgePanel(props);
+  document.getElementById('video-input').disabled = false;
+  document.getElementById('btn-analyze-video').disabled = false;
+}
+
+function renderSelectedEdgePanel(p) {
+  const box = document.getElementById('selected-edge-box');
+  box.classList.remove('empty');
+  box.innerHTML = `
+    <div class="row"><span class="k">Road type</span><span class="v">${p.highway}</span></div>
+    <div class="row"><span class="k">Length</span><span class="v">${p.length_m} m</span></div>
+    <div class="row"><span class="k">Capacity</span><span class="v">${p.capacity_veh_per_hr} veh/hr</span></div>
+    <div class="row"><span class="k">Live volume</span><span class="v">${p.current_volume ?? 0} veh</span></div>
+
+    <label class="field">Congestion score: <span id="cong-val">${p.congestion_score}</span></label>
+    <input type="range" id="cong-slider" min="0" max="1" step="0.05" value="${p.congestion_score}" />
+
+    <div class="btn-row" style="margin-top:12px;">
+      <button class="btn ${p.blocked ? 'danger' : ''}" id="btn-toggle-block">${p.blocked ? 'Unblock road' : 'Block road'}</button>
+    </div>
+
+    <label class="field">Special zone
+      <select id="zone-select">
+        <option value="" ${!p.zone_type ? 'selected' : ''}>None</option>
+        <option value="hospital" ${p.zone_type === 'hospital' ? 'selected' : ''}>Hospital</option>
+        <option value="school" ${p.zone_type === 'school' ? 'selected' : ''}>School</option>
+        <option value="emergency" ${p.zone_type === 'emergency' ? 'selected' : ''}>Emergency</option>
+      </select>
+    </label>
+  `;
+
+  document.getElementById('cong-slider').addEventListener('change', (e) => {
+    postJSON('/api/edge/congestion', { u: selectedEdge.u, v: selectedEdge.v, congestion_score: parseFloat(e.target.value) })
+      .then(() => { toast('Congestion updated'); loadGraph(); });
+  });
+  document.getElementById('cong-slider').addEventListener('input', (e) => {
+    document.getElementById('cong-val').textContent = e.target.value;
+  });
+  document.getElementById('btn-toggle-block').addEventListener('click', () => {
+    postJSON('/api/edge/block', { u: selectedEdge.u, v: selectedEdge.v, blocked: !p.blocked })
+      .then(() => { toast(p.blocked ? 'Road unblocked' : 'Road blocked'); loadGraph(); });
+  });
+  document.getElementById('zone-select').addEventListener('change', (e) => {
+    postJSON('/api/edge/zone', { u: selectedEdge.u, v: selectedEdge.v, zone_type: e.target.value || null })
+      .then(() => { toast('Zone tag updated'); loadGraph(); });
+  });
+}
+
+document.getElementById('btn-analyze-video').addEventListener('click', () => {
+  const input = document.getElementById('video-input');
+  if (!selectedEdge || !input.files.length) { toast('Select a road and a video first'); return; }
+  const fd = new FormData();
+  fd.append('video', input.files[0]);
+  fd.append('u', selectedEdge.u);
+  fd.append('v', selectedEdge.v);
+  document.getElementById('video-status').textContent = 'Analyzing footage…';
+  fetch('/api/traffic/video', { method: 'POST', body: fd })
+    .then(res => res.json())
+    .then(result => {
+      if (result.error) { document.getElementById('video-status').textContent = 'Error: ' + result.error; return; }
+      document.getElementById('video-status').textContent =
+        `Avg ${result.avg_moving_objects} moving objects/frame → congestion ${result.estimated_congestion_score}`;
+      toast('Applied camera analysis to road');
+      loadGraph();
+    })
+    .catch(() => { document.getElementById('video-status').textContent = 'Upload failed'; });
+});
+
+document.getElementById('btn-scenario-reset').addEventListener('click', () => {
+  postJSON('/api/scenario/reset', {}).then(() => { toast('Congestion & blocks reset'); loadGraph(); });
+});
+
+document.getElementById('peak-toggle').addEventListener('click', () => {
+  postJSON('/api/scenario/peak_hour', { enabled: !peakHour }).then(r => {
+    peakHour = r.peak_hour;
+    updatePeakUI();
+    toast('Peak hour ' + (peakHour ? 'enabled — zone roads penalized' : 'disabled'));
+    loadGraph();
+  });
+});
+function updatePeakUI() {
+  const btn = document.getElementById('peak-toggle');
+  btn.textContent = 'Peak Hour: ' + (peakHour ? 'On' : 'Off');
+  btn.classList.toggle('active', peakHour);
+  document.getElementById('ov-peak').textContent = peakHour ? 'On' : 'Off';
+}
+
+// ---------------------------------------------------------------------
+// Route finder
+// ---------------------------------------------------------------------
+function handleNodeClick(nodeId, latlng) {
+  if (document.getElementById('pane-route').classList.contains('active')) {
+    if (routeSource === null) {
+      routeSource = nodeId;
+      document.getElementById('route-source').textContent = nodeId;
+      L.circleMarker(latlng, { radius: 6, color: '#2ecc71', fillColor: '#2ecc71', fillOpacity: 1 }).addTo(routeLayer);
+    } else if (routeTarget === null) {
+      routeTarget = nodeId;
+      document.getElementById('route-target').textContent = nodeId;
+      L.circleMarker(latlng, { radius: 6, color: '#e0483f', fillColor: '#e0483f', fillOpacity: 1 }).addTo(routeLayer);
+    }
+  }
+}
+
+document.getElementById('btn-find-route').addEventListener('click', () => {
+  if (routeSource === null || routeTarget === null) { toast('Pick a start and end node first'); return; }
+  const by = document.getElementById('route-by').value;
+  fetch(`/api/route?source=${routeSource}&target=${routeTarget}&by=${by}`)
+    .then(res => res.json())
+    .then(result => {
+      if (result.error) { toast(result.error); return; }
+      routeLayer.eachLayer(l => { if (l._routeLine) routeLayer.removeLayer(l); });
+      const line = L.geoJSON(result.geometry, { style: { color: '#4fd1c5', weight: 5, opacity: 0.95 } }).addTo(routeLayer);
+      line.eachLayer(l => l._routeLine = true);
+      map.fitBounds(line.getBounds(), { padding: [40, 40] });
+
+      document.getElementById('route-result').style.display = 'block';
+      document.getElementById('route-dist-row').style.display = 'flex';
+      document.getElementById('route-time-row').style.display = 'flex';
+      document.getElementById('route-dist').textContent = result.distance_m + ' m';
+      document.getElementById('route-time').textContent = result.time_min + ' min';
+    });
+});
+
+document.getElementById('btn-clear-route').addEventListener('click', () => {
+  routeSource = null; routeTarget = null;
+  routeLayer.clearLayers();
+  document.getElementById('route-source').textContent = '–';
+  document.getElementById('route-target').textContent = '–';
+  document.getElementById('route-result').style.display = 'none';
+  document.getElementById('route-dist-row').style.display = 'none';
+  document.getElementById('route-time-row').style.display = 'none';
+});
+
+// ---------------------------------------------------------------------
+// Vehicle simulation
+// ---------------------------------------------------------------------
+document.getElementById('btn-spawn').addEventListener('click', () => {
+  const count = parseInt(document.getElementById('spawn-count').value, 10) || 10;
+  postJSON('/api/simulation/spawn', { count }).then(r => {
+    toast(`Spawned ${r.spawned} vehicles`);
+    refreshSimState();
+  });
+});
+
+document.getElementById('btn-sim-start').addEventListener('click', () => {
+  if (simTimer) return;
+  document.getElementById('btn-sim-start').disabled = true;
+  document.getElementById('btn-sim-stop').disabled = false;
+  simTimer = setInterval(() => {
+    postJSON('/api/simulation/tick', { dt_min: 0.5 }).then(() => {
+      refreshSimState();
+      loadGraph(); // reflect vehicle load feeding back into congestion colors
+    });
+  }, 1200);
+});
+
+document.getElementById('btn-sim-stop').addEventListener('click', () => {
+  clearInterval(simTimer); simTimer = null;
+  document.getElementById('btn-sim-start').disabled = false;
+  document.getElementById('btn-sim-stop').disabled = true;
+});
+
+document.getElementById('btn-sim-reset').addEventListener('click', () => {
+  postJSON('/api/simulation/reset', {}).then(() => {
+    vehicleLayer.clearLayers();
+    vehicleMarkers = {};
+    refreshSimState();
+    loadGraph();
+    toast('Vehicle simulation reset');
+  });
+});
+
+function refreshSimState() {
+  fetch('/api/simulation/state').then(res => res.json()).then(state => {
+    document.getElementById('sim-tick').textContent = state.tick;
+    document.getElementById('sim-active').textContent = state.active;
+    document.getElementById('sim-arrived').textContent = state.arrived;
+    document.getElementById('ov-vehicles').textContent = state.total;
+    drawVehicles(state.vehicles);
+  });
+}
+
+function drawVehicles(vehicles) {
+  const seen = new Set();
+  vehicles.forEach(v => {
+    seen.add(v.id);
+    const latlng = [v.lat, v.lng];
+    if (vehicleMarkers[v.id]) {
+      vehicleMarkers[v.id].setLatLng(latlng);
+      vehicleMarkers[v.id].setStyle({ fillOpacity: v.status === 'arrived' ? 0.25 : 0.95 });
+    } else {
+      vehicleMarkers[v.id] = L.circleMarker(latlng, {
+        radius: 4, className: 'vehicle-marker', color: v.color, fillColor: v.color, fillOpacity: 0.95, weight: 1.5,
+      }).addTo(vehicleLayer);
+    }
+  });
+  Object.keys(vehicleMarkers).forEach(id => {
+    if (!seen.has(id)) { vehicleLayer.removeLayer(vehicleMarkers[id]); delete vehicleMarkers[id]; }
+  });
+}
+
+// ---------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------
+function postJSON(url, body) {
+  return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(res => res.json());
+}
+
+loadGraph().catch(err => {
+  document.getElementById('status-dot').style.background = '#e0483f';
+  toast('Failed to load graph');
+  console.error(err);
+});
 </script>
 
 </body>
