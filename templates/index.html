@@ -37,21 +37,55 @@
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text);
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
-  #map { position: absolute; inset: 0; background: #eceef4; }
+  body { display: flex; overflow: hidden; }
 
-  .topbar {
-    position: absolute; top: 0; left: 0; right: 0; z-index: 1000;
-    display: flex; align-items: center; gap: 10px;
-    padding: 12px 16px; background: linear-gradient(to bottom, rgba(242,243,248,0.96), rgba(242,243,248,0));
-    pointer-events: none;
+  /* ================= Sidebar ================= */
+  .sidebar {
+    width: 76px; flex-shrink: 0; height: 100%; background: var(--panel);
+    border-right: 1px solid var(--border); display: flex; flex-direction: column;
+    align-items: center; padding: 18px 0; gap: 22px; z-index: 1200;
   }
-  .topbar .title { font-weight: 700; font-size: 15px; letter-spacing: 0.2px; pointer-events: auto; color: var(--text); }
-  .topbar .subtitle { font-size: 12px; color: var(--text-dim); pointer-events: auto; }
+  .sidebar-logo {
+    width: 40px; height: 40px; border-radius: 12px; background: var(--accent); color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 6px 16px rgba(var(--accent-rgb),0.35);
+  }
+  .sidebar-logo svg { width: 20px; height: 20px; }
+  .sidebar-nav { display: flex; flex-direction: column; gap: 8px; flex: 1; }
+  .sidebar-tab {
+    width: 42px; height: 42px; border-radius: 12px; border: none; background: transparent;
+    color: var(--text-faint); display: flex; align-items: center; justify-content: center;
+    cursor: pointer; transition: all .15s;
+  }
+  .sidebar-tab svg { width: 20px; height: 20px; }
+  .sidebar-tab:hover { background: var(--panel-2); color: var(--text-dim); }
+  .sidebar-tab.active { background: rgba(var(--accent-rgb),0.12); color: var(--accent); }
+  .sidebar-bottom { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+  .sidebar-icon-btn {
+    width: 36px; height: 36px; border-radius: 10px; border: 1px solid var(--border); background: var(--panel);
+    display: flex; align-items: center; justify-content: center; cursor: pointer;
+  }
+  .sidebar-icon-btn:hover { border-color: var(--accent); }
+  .sidebar-avatar {
+    width: 36px; height: 36px; border-radius: 50%; background: linear-gradient(135deg, var(--accent), #8b5cf6);
+    color: #fff; font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: center;
+  }
+
+  /* ================= Main column ================= */
+  .main-col { flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; }
+
+  .topheader {
+    flex-shrink: 0; display: flex; align-items: center; justify-content: space-between;
+    padding: 20px 24px 14px; gap: 16px;
+  }
+  .topheader-titles .title { font-weight: 800; font-size: 20px; letter-spacing: -0.2px; color: var(--text); }
+  .topheader-titles .subtitle { font-size: 12.5px; color: var(--text-dim); margin-top: 3px; }
+  .topheader-actions { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+
   .live-dot {
-    width: 7px; height: 7px; border-radius: 50%; background: var(--low);
+    width: 9px; height: 9px; border-radius: 50%; background: var(--low);
     box-shadow: 0 0 0 3px rgba(var(--low-rgb),0.18);
     animation: pulse 2.4s ease-in-out infinite;
-    cursor: pointer; pointer-events: auto;
   }
   .live-dot.paused {
     background: var(--text-faint);
@@ -63,44 +97,49 @@
     50% { box-shadow: 0 0 0 6px rgba(var(--low-rgb),0.06); }
   }
 
+  /* ================= Content split (list column + map) ================= */
+  .content-split { flex: 1; min-height: 0; display: flex; gap: 16px; padding: 0 24px 24px; }
+
   #console {
-    position: absolute; top: 52px; right: 14px; bottom: 14px; width: 340px; z-index: 1000;
-    background: var(--panel); border: 1px solid var(--border); border-radius: 16px;
-    display: flex; flex-direction: column; overflow: hidden;
-    box-shadow: 0 12px 32px rgba(23,25,35,0.10), 0 2px 8px rgba(23,25,35,0.05);
-    transition: transform 0.25s ease, opacity 0.25s ease;
+    width: 380px; flex-shrink: 0; display: flex; flex-direction: column;
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 18px; overflow: hidden;
+    box-shadow: 0 2px 10px rgba(23,25,35,0.04);
+    transition: width .25s ease, opacity .2s ease, margin .25s ease;
   }
-  #console.collapsed { transform: translateX(360px); opacity: 0; pointer-events: none; }
+  #console.collapsed { width: 0; opacity: 0; margin-right: -16px; border-width: 0; pointer-events: none; }
 
   .console-head {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 12px 14px; border-bottom: 1px solid var(--border); background: var(--panel);
+    padding: 14px 16px; border-bottom: 1px solid var(--border); background: var(--panel); flex-shrink: 0;
   }
   .console-head span { font-size: 12px; font-weight: 700; letter-spacing: 0.4px; color: var(--text); text-transform: uppercase; }
   #console-toggle {
     background: var(--panel-2); border: 1px solid var(--border); color: var(--text-dim);
-    border-radius: 8px; width: 24px; height: 24px; cursor: pointer; font-size: 13px;
+    border-radius: 8px; width: 26px; height: 26px; cursor: pointer; font-size: 14px;
   }
   #console-toggle:hover { color: var(--text); border-color: var(--accent); }
 
   #show-console {
-    position: absolute; top: 52px; right: 14px; z-index: 999; display: none;
+    position: fixed; top: 22px; left: 100px; z-index: 1300; display: none;
     background: var(--panel); border: 1px solid var(--border); color: var(--text-dim);
-    border-radius: 10px; padding: 7px 12px; font-size: 12px; cursor: pointer;
-    box-shadow: 0 4px 14px rgba(23,25,35,0.08);
+    border-radius: 10px; padding: 8px 14px; font-size: 12px; cursor: pointer; font-weight: 600;
+    box-shadow: 0 8px 20px rgba(23,25,35,0.10);
   }
-  #console.collapsed ~ #show-console { display: block; }
+  body.console-collapsed #show-console { display: block; }
 
-  .tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--panel); flex-shrink: 0; padding: 0 6px; }
-  .tab {
-    flex: 1; text-align: center; padding: 10px 4px; font-size: 11.5px; color: var(--text-faint);
-    cursor: pointer; border-bottom: 2px solid transparent; user-select: none; font-weight: 600;
+  .console-body { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; }
+
+  .tabs { display: none; }
+  .tab { cursor: pointer; }
+
+  .panel { display: none; flex-direction: column; gap: 12px; }
+  .panel.active { display: flex; }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    padding: 16px; box-shadow: 0 2px 8px rgba(23,25,35,0.03);
   }
-  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
-  .tab:hover:not(.active) { color: var(--text-dim); }
-
-  .panel { display: none; padding: 14px; overflow-y: auto; flex: 1; background: var(--panel-2); }
-  .panel.active { display: block; }
+  .card .section-label:first-child { margin-top: 0; }
 
   .stat-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; font-size: 12.5px; }
   .stat-row .k { color: var(--text-dim); }
@@ -117,7 +156,7 @@
     font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-faint);
     margin: 4px 0 8px; font-weight: 700;
   }
-  .legend { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+  .legend { margin-top: 0; padding-top: 0; border-top: none; }
 
   .gauge-wrap { display: flex; align-items: center; gap: 12px; margin-top: 6px; }
   #load-gauge {
@@ -253,13 +292,13 @@
   .pick-marker-origin { background: #16a34a; }
   .pick-marker-dest { background: #dc2626; }
 
-  /* ---- Drive bar (top): pick start/end nodes, start/stop drive ---- */
+  /* ---- Drive bar: pick start/end nodes, start/stop drive ---- */
   .drivebar {
-    position: absolute; top: 46px; left: 14px; z-index: 1000;
-    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
-    padding: 9px 11px; box-shadow: 0 12px 32px rgba(23,25,35,0.10), 0 2px 8px rgba(23,25,35,0.05);
-    font-size: 12.5px; max-width: 640px;
+    flex-shrink: 0; margin: 0 24px 16px; z-index: 500;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 16px;
+    padding: 12px 14px; box-shadow: 0 2px 10px rgba(23,25,35,0.04);
+    font-size: 12.5px;
   }
   .drive-field { display: flex; align-items: center; gap: 6px; }
   .drive-field .dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
@@ -267,11 +306,12 @@
   .drive-field .dot.end { background: var(--high); }
   .drivebar button {
     background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
-    border-radius: 8px; padding: 7px 11px; font-size: 12px; cursor: pointer; font-weight: 600;
+    border-radius: 9px; padding: 8px 13px; font-size: 12px; cursor: pointer; font-weight: 600;
   }
   .drivebar button:hover { border-color: var(--accent); color: var(--accent); }
   .drivebar button.picking { border-color: var(--accent); color: var(--accent); box-shadow: 0 0 0 2px rgba(var(--accent-rgb),0.18); }
   .drivebar button.set { color: var(--text); border-color: rgba(var(--low-rgb),0.5); }
+  #drive-info { margin-right: auto; }
   .drivebar button#drive-start-btn {
     background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 700;
     box-shadow: 0 4px 12px rgba(var(--accent-rgb),0.28);
@@ -360,58 +400,112 @@
   .leaflet-bar a { background: var(--panel) !important; color: var(--text) !important; border-bottom: 1px solid var(--border) !important; }
   .leaflet-bar a:hover { background: var(--panel-2) !important; color: var(--accent) !important; }
   .leaflet-control-attribution { background: rgba(255,255,255,0.85) !important; color: var(--text-faint) !important; }
+
+  /* ================= Map column ================= */
+  .map-col {
+    flex: 1; min-width: 0; position: relative; border-radius: 20px; overflow: hidden;
+    border: 1px solid var(--border); box-shadow: 0 4px 18px rgba(23,25,35,0.06);
+  }
+  #map { position: absolute; inset: 0; background: #eceef4; }
+
+  .map-chip {
+    position: absolute; z-index: 500; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 8px 14px; box-shadow: 0 6px 18px rgba(23,25,35,0.10);
+    font-size: 12px; font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 7px;
+  }
+  .map-chip svg { flex-shrink: 0; color: var(--accent); }
+  .map-chip-top { top: 16px; left: 16px; }
+
+  .map-stats-bar {
+    position: absolute; left: 16px; right: 16px; bottom: 16px; z-index: 500;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 16px;
+    box-shadow: 0 8px 24px rgba(23,25,35,0.10);
+    display: flex; align-items: stretch; padding: 12px 8px;
+  }
+  .map-stat {
+    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 3px; padding: 0 10px; border-right: 1px solid var(--border);
+  }
+  .map-stat:last-child { border-right: none; }
+  .map-stat-lab { font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--text-faint); font-weight: 700; }
+  .map-stat-val { font-size: 14px; font-weight: 800; color: var(--text); }
 </style>
 </head>
 <body>
 
-<div id="map"></div>
-
-<div class="topbar">
-  <span class="live-dot" id="live-dot" title="Click to pause/resume the live simulation"></span>
-  <span class="title">Urban Traffic Control</span>
-  <span class="subtitle">— live digital twin</span>
-  <button id="peak-toggle" title="City-wide policy: penalize through-traffic on hospital/school/emergency zones even harder">Peak Hour: Off</button>
-</div>
-
-<div class="drivebar" id="drivebar">
-  <div class="drive-field">
-    <span class="dot start"></span>
-    <button id="drive-pick-start" title="Click, then click a node on the map">Pick start</button>
-  </div>
-  <div class="drive-field">
-    <span class="dot end"></span>
-    <button id="drive-pick-end" title="Click, then click a node on the map">Pick end</button>
-  </div>
-  <button id="drive-start-btn" disabled>▶ Start Drive</button>
-  <button id="drive-stop-btn" style="display:none;">■ Stop</button>
-  <div id="drive-info"></div>
-</div>
-
-<button id="show-console" onclick="document.getElementById('console').classList.remove('collapsed')">Show panel</button>
-<div id="toast"></div>
-
-<div id="console">
-  <div class="console-head">
-    <span>Control Console</span>
-    <button id="console-toggle" title="Collapse">✕</button>
+<aside class="sidebar">
+  <div class="sidebar-logo" title="Urban Traffic Control">
+    <svg viewBox="0 0 24 24" fill="none"><circle cx="6" cy="6" r="2.4" fill="currentColor"/><circle cx="18" cy="6" r="2.4" fill="currentColor"/><circle cx="12" cy="18" r="2.4" fill="currentColor"/><path d="M6 8.4V12a2 2 0 0 0 2 2h2m4 0h2a2 2 0 0 0 2-2V8.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
   </div>
 
-  <div class="tabs" role="tablist">
-    <div class="tab active" data-tab="network" role="tab" aria-selected="true">Network</div>
-    <div class="tab" data-tab="route" role="tab" aria-selected="false">Route</div>
-    <div class="tab" data-tab="zones" role="tab" aria-selected="false">Zones</div>
-    <div class="tab" data-tab="camera" role="tab" aria-selected="false">Camera</div>
-    <div class="tab" data-tab="vehicles" role="tab" aria-selected="false">Demo</div>
+  <nav class="sidebar-nav" role="tablist">
+    <button class="tab sidebar-tab active" data-tab="network" role="tab" aria-selected="true" title="Network">
+      <svg viewBox="0 0 24 24" fill="none"><rect x="3.5" y="3.5" width="7" height="7" rx="1.8" stroke="currentColor" stroke-width="1.8"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.8" stroke="currentColor" stroke-width="1.8"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.8" stroke="currentColor" stroke-width="1.8"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.8" stroke="currentColor" stroke-width="1.8"/></svg>
+    </button>
+    <button class="tab sidebar-tab" data-tab="route" role="tab" aria-selected="false" title="Route">
+      <svg viewBox="0 0 24 24" fill="none"><circle cx="5.5" cy="6" r="2.2" stroke="currentColor" stroke-width="1.8"/><circle cx="18.5" cy="18" r="2.2" stroke="currentColor" stroke-width="1.8"/><path d="M5.5 8.2V11a3 3 0 0 0 3 3h5a3 3 0 0 1 3 3v0.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-dasharray="2.4 2.4"/></svg>
+    </button>
+    <button class="tab sidebar-tab" data-tab="zones" role="tab" aria-selected="false" title="Zones">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M6 3.5v17" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M6 4.5h10.5c1.4 0 2 1.3 1 2.3l-2.3 2.2 2.3 2.2c1 1 0.4 2.3-1 2.3H6" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+    </button>
+    <button class="tab sidebar-tab" data-tab="camera" role="tab" aria-selected="false" title="Camera">
+      <svg viewBox="0 0 24 24" fill="none"><rect x="3" y="7" width="14" height="11" rx="2.2" stroke="currentColor" stroke-width="1.8"/><path d="M17 10.2l4-2.2v8l-4-2.2" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+    </button>
+    <button class="tab sidebar-tab" data-tab="vehicles" role="tab" aria-selected="false" title="Demo vehicles">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M3.5 15V12l1.8-4.2A2 2 0 0 1 7.1 6.5h9.8a2 2 0 0 1 1.8 1.3L20.5 12v3" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><rect x="2.5" y="12" width="19" height="4.5" rx="1.5" stroke="currentColor" stroke-width="1.8"/><circle cx="7" cy="18.5" r="1.7" fill="currentColor"/><circle cx="17" cy="18.5" r="1.7" fill="currentColor"/></svg>
+    </button>
+  </nav>
+
+  <div class="sidebar-bottom">
+    <button class="sidebar-icon-btn" id="live-dot-btn" title="Click to pause/resume the live simulation">
+      <span class="live-dot" id="live-dot"></span>
+    </button>
+    <div class="sidebar-avatar" title="Urban Traffic Control">U</div>
+  </div>
+</aside>
+
+<div class="main-col">
+  <header class="topheader">
+    <div class="topheader-titles">
+      <div class="title">Urban Traffic Control</div>
+      <div class="subtitle">Explore &amp; manage your city's live network</div>
+    </div>
+    <div class="topheader-actions">
+      <div id="source-badge" class="badge">loading…</div>
+      <button id="peak-toggle" title="City-wide policy: penalize through-traffic on hospital/school/emergency zones even harder">Peak Hour: Off</button>
+    </div>
+  </header>
+
+  <div class="drivebar" id="drivebar">
+    <div class="drive-field">
+      <span class="dot start"></span>
+      <button id="drive-pick-start" title="Click, then click a node on the map">Pick start</button>
+    </div>
+    <div class="drive-field">
+      <span class="dot end"></span>
+      <button id="drive-pick-end" title="Click, then click a node on the map">Pick end</button>
+    </div>
+    <div id="drive-info"></div>
+    <button id="drive-start-btn" disabled>▶ Start Drive</button>
+    <button id="drive-stop-btn" style="display:none;">■ Stop</button>
   </div>
 
+  <div class="content-split">
+    <div id="console">
+      <div class="console-head">
+        <span>Control Panel</span>
+        <button id="console-toggle" title="Collapse">‹</button>
+      </div>
+      <div class="console-body">
   <!-- ============ NETWORK TAB ============ -->
   <div class="panel active" data-panel="network">
-    <div class="section-label">Road graph</div>
-    <div class="stat-row"><span class="k">Nodes</span><span class="v" id="node-count">–</span></div>
-    <div class="stat-row"><span class="k">Road segments</span><span class="v" id="edge-count">–</span></div>
-    <div id="source-badge" class="badge">loading…</div>
+    <div class="card">
+      <div class="section-label">Road graph</div>
+      <div class="stat-row"><span class="k">Nodes</span><span class="v" id="node-count">–</span></div>
+      <div class="stat-row"><span class="k">Road segments</span><span class="v" id="edge-count">–</span></div>
+    </div>
 
-    <div class="legend">
+    <div class="card">
       <div class="section-label">Live simulation</div>
       <div class="stat-row"><span class="k">Sim clock</span><span class="v" id="sim-clock">–</span></div>
       <div class="stat-row"><span class="k">Active vehicles</span><span class="v" id="sim-vehicles">–</span></div>
@@ -422,7 +516,7 @@
       <div class="stat-row"><span class="k">CO₂ emitted</span><span class="v" id="sim-co2">–</span></div>
     </div>
 
-    <div class="legend">
+    <div class="card">
       <div class="section-label">Network load</div>
       <div class="gauge-wrap">
         <div id="load-gauge"></div>
@@ -430,7 +524,7 @@
       </div>
     </div>
 
-    <div class="legend">
+    <div class="card">
       <div class="section-label">Congestion legend</div>
       <div class="swatch-row"><span class="swatch" style="background:#16a34a"></span> Free-flowing (&lt; 0.4)</div>
       <div class="swatch-row"><span class="swatch" style="background:#d97706"></span> Moderate (0.4 – 0.7)</div>
@@ -439,7 +533,7 @@
       <div class="swatch-row"><span class="swatch" style="background:#f43f5e;border-radius:50%"></span> Emergency vehicle</div>
     </div>
 
-    <div class="legend">
+    <div class="card">
       <div class="section-label">How to use this map</div>
       <div class="empty-note">
         Click any road or intersection to open its live control panel —
@@ -452,82 +546,126 @@
 
   <!-- ============ ROUTE TAB ============ -->
   <div class="panel" data-panel="route">
-    <div class="section-label">Find optimal route</div>
-    <div class="route-field">
-      <label>Origin</label>
-      <button class="route-pick-btn origin" id="pick-origin-btn">
-        <span class="dot"></span><span class="val" id="origin-val">Click to pick on map</span>
-      </button>
+    <div class="card">
+      <div class="section-label">Find optimal route</div>
+      <div class="route-field">
+        <label>Origin</label>
+        <button class="route-pick-btn origin" id="pick-origin-btn">
+          <span class="dot"></span><span class="val" id="origin-val">Click to pick on map</span>
+        </button>
+      </div>
+      <div class="route-field">
+        <label>Destination</label>
+        <button class="route-pick-btn dest" id="pick-dest-btn">
+          <span class="dot"></span><span class="val" id="dest-val">Click to pick on map</span>
+        </button>
+      </div>
+      <button id="route-find-btn" disabled>Find optimal route</button>
+      <button id="route-clear-btn">Clear route</button>
+      <div id="route-result"></div>
     </div>
-    <div class="route-field">
-      <label>Destination</label>
-      <button class="route-pick-btn dest" id="pick-dest-btn">
-        <span class="dot"></span><span class="val" id="dest-val">Click to pick on map</span>
-      </button>
-    </div>
-    <button id="route-find-btn" disabled>Find optimal route</button>
-    <button id="route-clear-btn">Clear route</button>
-    <div id="route-result"></div>
-    <div id="route-hint">
-      The route minimises a blend of distance and live citywide congestion
-      (travel time under the network's current BPR/signal-delay weights) —
-      not just the shortest path.
+    <div class="card">
+      <div id="route-hint">
+        The route minimises a blend of distance and live citywide congestion
+        (travel time under the network's current BPR/signal-delay weights) —
+        not just the shortest path.
+      </div>
     </div>
   </div>
 
   <!-- ============ ZONES TAB ============ -->
   <div class="panel" data-panel="zones">
-    <div class="section-label">Assigned special zones</div>
-    <div id="zone-list"><div class="empty-note">No roads tagged yet. Click a road on the map and use "Assign zone" to mark it as a hospital, school, or emergency zone.</div></div>
+    <div class="card">
+      <div class="section-label">Assigned special zones</div>
+      <div id="zone-list"><div class="empty-note">No roads tagged yet. Click a road on the map and use "Assign zone" to mark it as a hospital, school, or emergency zone.</div></div>
+    </div>
   </div>
 
   <!-- ============ CAMERA TAB ============ -->
   <div class="panel" data-panel="camera">
-    <div class="section-label">Traffic-camera analysis</div>
-    <div class="empty-note">
-      Click a road on the map to select it, then upload a short clip. The
-      server runs OpenCV background-subtraction + contour counting to
-      estimate a live congestion score from actual vehicle motion, and
-      applies it to that road for ~10 simulated minutes — the same
-      "camera → congestion" IoT path a real CCTV/YOLOv8 pipeline would use.
+    <div class="card">
+      <div class="section-label">Traffic-camera analysis</div>
+      <div class="empty-note">
+        Click a road on the map to select it, then upload a short clip. The
+        server runs OpenCV background-subtraction + contour counting to
+        estimate a live congestion score from actual vehicle motion, and
+        applies it to that road for ~10 simulated minutes — the same
+        "camera → congestion" IoT path a real CCTV/YOLOv8 pipeline would use.
+      </div>
     </div>
-    <div class="section-label" style="margin-top:14px;">Selected road</div>
-    <div class="selected-road-chip empty" id="cam-selected-chip">No road selected — click one on the map</div>
-    <label style="font-size:11px;color:var(--text-faint);text-transform:uppercase;letter-spacing:0.4px;">Video clip</label>
-    <input type="file" id="cam-video-input" accept="video/*" disabled />
-    <button id="cam-analyze-btn" class="primary-btn" style="margin-top:10px;" disabled>Analyze &amp; apply</button>
-    <div id="cam-status"></div>
+    <div class="card">
+      <div class="section-label">Selected road</div>
+      <div class="selected-road-chip empty" id="cam-selected-chip">No road selected — click one on the map</div>
+      <label style="font-size:11px;color:var(--text-faint);text-transform:uppercase;letter-spacing:0.4px;font-weight:700;">Video clip</label>
+      <input type="file" id="cam-video-input" accept="video/*" disabled />
+      <button id="cam-analyze-btn" class="primary-btn" style="margin-top:10px;" disabled>Analyze &amp; apply</button>
+      <div id="cam-status"></div>
+    </div>
   </div>
 
   <!-- ============ DEMO VEHICLES TAB ============ -->
   <div class="panel" data-panel="vehicles">
-    <div class="section-label">Demo vehicle batch</div>
-    <div class="empty-note">
-      Spawn a small tracked batch of vehicles and step them forward
-      manually — separate from the always-on background simulation above.
-      They still route against the live, congestion-aware graph, so they
-      react to any block/jam/boost/zone change exactly like real traffic.
+    <div class="card">
+      <div class="section-label">Demo vehicle batch</div>
+      <div class="empty-note">
+        Spawn a small tracked batch of vehicles and step them forward
+        manually — separate from the always-on background simulation above.
+        They still route against the live, congestion-aware graph, so they
+        react to any block/jam/boost/zone change exactly like real traffic.
+      </div>
+      <div class="field-row">
+        <label>Vehicles to spawn</label>
+        <input type="number" id="demo-spawn-count" value="15" min="1" max="200" />
+      </div>
+      <div class="btn-row-2">
+        <button class="side-btn primary" id="demo-btn-spawn">Spawn</button>
+        <button class="side-btn danger" id="demo-btn-reset">Reset</button>
+      </div>
+      <div class="btn-row-2">
+        <button class="side-btn" id="demo-btn-start">Start ticking</button>
+        <button class="side-btn" id="demo-btn-stop" disabled>Stop</button>
+      </div>
     </div>
-    <div class="field-row">
-      <label>Vehicles to spawn</label>
-      <input type="number" id="demo-spawn-count" value="15" min="1" max="200" />
-    </div>
-    <div class="btn-row-2">
-      <button class="side-btn primary" id="demo-btn-spawn">Spawn</button>
-      <button class="side-btn danger" id="demo-btn-reset">Reset</button>
-    </div>
-    <div class="btn-row-2">
-      <button class="side-btn" id="demo-btn-start">Start ticking</button>
-      <button class="side-btn" id="demo-btn-stop" disabled>Stop</button>
-    </div>
-    <div class="legend">
+    <div class="card">
       <div class="section-label">Status</div>
       <div class="stat-row"><span class="k">Tick</span><span class="v" id="demo-tick">0</span></div>
       <div class="stat-row"><span class="k">Active</span><span class="v" id="demo-active">0</span></div>
       <div class="stat-row"><span class="k">Arrived</span><span class="v" id="demo-arrived">0</span></div>
     </div>
   </div>
+      </div>
+    </div>
+
+    <div class="map-col">
+      <div id="map"></div>
+      <div class="map-chip map-chip-top" id="map-chip-top">
+        <svg viewBox="0 0 24 24" fill="none" width="14" height="14"><rect x="3.5" y="3.5" width="7" height="7" rx="1.6" stroke="currentColor" stroke-width="1.8"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.6" stroke="currentColor" stroke-width="1.8"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.6" stroke="currentColor" stroke-width="1.8"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.6" stroke="currentColor" stroke-width="1.8"/></svg>
+        <span><span id="map-chip-nodecount">–</span> nodes · <span id="map-chip-edgecount">–</span> segments</span>
+      </div>
+      <div class="map-stats-bar">
+        <div class="map-stat">
+          <span class="map-stat-lab">Sim clock</span>
+          <span class="map-stat-val" id="map-chip-clock">–</span>
+        </div>
+        <div class="map-stat">
+          <span class="map-stat-lab">Active vehicles</span>
+          <span class="map-stat-val" id="map-chip-vehicles">–</span>
+        </div>
+        <div class="map-stat">
+          <span class="map-stat-lab">Avg travel time</span>
+          <span class="map-stat-val" id="map-chip-avgtime">–</span>
+        </div>
+        <div class="map-stat">
+          <span class="map-stat-lab">CO₂ emitted</span>
+          <span class="map-stat-val" id="map-chip-co2">–</span>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
+
+<button id="show-console">Show panel</button>
+<div id="toast"></div>
 
 <script>
   const map = L.map('map', { zoomControl: true }).setView([{{ center_lat }}, {{ center_lng }}], 16);
@@ -577,9 +715,15 @@
   // Console UI: tabs + collapse toggle
   // ------------------------------------------------------------------
   const consoleEl = document.getElementById('console');
-  document.getElementById('console-toggle').addEventListener('click', () => {
-    consoleEl.classList.toggle('collapsed');
-  });
+  function setConsoleCollapsed(collapsed) {
+    consoleEl.classList.toggle('collapsed', collapsed);
+    document.body.classList.toggle('console-collapsed', collapsed);
+    setTimeout(() => map.invalidateSize(), 260);
+  }
+  document.getElementById('console-toggle').addEventListener('click', () => setConsoleCollapsed(true));
+  document.getElementById('show-console').addEventListener('click', () => setConsoleCollapsed(false));
+  window.addEventListener('resize', () => map.invalidateSize());
+
   document.querySelectorAll('.tab').forEach((tab) => {
     tab.addEventListener('click', () => {
       document.querySelectorAll('.tab').forEach((t) => { t.classList.remove('active'); t.setAttribute('aria-selected', 'false'); });
@@ -592,7 +736,7 @@
 
   let simRunning = true;
   const liveDot = document.getElementById('live-dot');
-  liveDot.addEventListener('click', () => {
+  document.getElementById('live-dot-btn').addEventListener('click', () => {
     const endpoint = simRunning ? '/api/simulate/stop' : '/api/simulate/start';
     fetch(endpoint, { method: 'POST' }).then(res => res.json()).then(data => {
       simRunning = data.running;
@@ -1297,6 +1441,11 @@
         document.getElementById('sim-surge').textContent = data.peak_surge_active ? 'Active' : 'Off';
         document.getElementById('sim-co2').textContent = `${data.total_co2_kg} kg`;
 
+        document.getElementById('map-chip-clock').textContent = data.sim_day_hhmm;
+        document.getElementById('map-chip-vehicles').textContent = data.active_vehicles;
+        document.getElementById('map-chip-avgtime').textContent = data.avg_travel_time_min != null ? `${data.avg_travel_time_min} min` : '–';
+        document.getElementById('map-chip-co2').textContent = `${data.total_co2_kg} kg`;
+
         const avgPct = Math.round(Math.min(data.avg_network_load, 1) * 100);
         document.getElementById('load-gauge').style.setProperty('--pct', avgPct);
         document.getElementById('load-value').textContent = `${avgPct}%`;
@@ -1318,6 +1467,8 @@
     .then(data => {
       document.getElementById('node-count').textContent = data.node_count;
       document.getElementById('edge-count').textContent = data.edge_count;
+      document.getElementById('map-chip-nodecount').textContent = data.node_count;
+      document.getElementById('map-chip-edgecount').textContent = data.edge_count;
       const badge = document.getElementById('source-badge');
       if (data.using_synthetic) {
         badge.textContent = 'Synthetic grid (offline mode)';
