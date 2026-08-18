@@ -235,6 +235,44 @@
   .pick-marker-origin { background: #2ecc71; }
   .pick-marker-dest { background: #e74c3c; }
 
+  /* ---- Drive bar (top): pick start/end nodes, start/stop drive ---- */
+  .drivebar {
+    position: absolute; top: 46px; left: 14px; z-index: 1000;
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 8px 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+    font-size: 12.5px; max-width: 640px;
+  }
+  .drive-field { display: flex; align-items: center; gap: 6px; }
+  .drive-field .dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+  .drive-field .dot.start { background: var(--low); }
+  .drive-field .dot.end { background: var(--high); }
+  .drivebar button {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 6px 10px; font-size: 12px; cursor: pointer;
+  }
+  .drivebar button:hover { border-color: var(--accent); }
+  .drivebar button.picking { border-color: var(--accent); color: var(--accent); box-shadow: 0 0 0 2px rgba(51,136,255,0.2); }
+  .drivebar button.set { color: var(--text); border-color: rgba(46,204,113,0.5); }
+  .drivebar button#drive-start-btn {
+    background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600;
+  }
+  .drivebar button#drive-start-btn:disabled { background: #2a3448; border-color: var(--border); color: var(--text-faint); cursor: not-allowed; }
+  .drivebar button#drive-stop-btn { background: var(--high); border-color: var(--high); color: #fff; font-weight: 600; }
+  #drive-info { display: flex; gap: 12px; font-size: 12px; color: var(--text-dim); }
+  #drive-info b { color: var(--text); }
+  #drive-info .reroute-flash { color: var(--mid); font-weight: 700; }
+
+  .car-triangle {
+    width: 0; height: 0;
+    border-left: 7px solid transparent;
+    border-right: 7px solid transparent;
+    border-bottom: 17px solid #00e5ff;
+    filter: drop-shadow(0 0 5px rgba(0,229,255,0.9)) drop-shadow(0 0 2px rgba(0,0,0,0.6));
+    transform-origin: 50% 65%;
+    transition: transform 0.15s linear; /* smooths out the per-poll bearing snap */
+  }
+
   /* ---- Peak-hour toggle (topbar) ---- */
   #peak-toggle {
     pointer-events: auto; font-size: 11px; letter-spacing: 0.3px; text-transform: uppercase;
@@ -304,6 +342,20 @@
   <span class="title">Urban Traffic Control</span>
   <span class="subtitle">— live digital twin</span>
   <button id="peak-toggle" title="City-wide policy: penalize through-traffic on hospital/school/emergency zones even harder">Peak Hour: Off</button>
+</div>
+
+<div class="drivebar" id="drivebar">
+  <div class="drive-field">
+    <span class="dot start"></span>
+    <button id="drive-pick-start" title="Click, then click a node on the map">Pick start</button>
+  </div>
+  <div class="drive-field">
+    <span class="dot end"></span>
+    <button id="drive-pick-end" title="Click, then click a node on the map">Pick end</button>
+  </div>
+  <button id="drive-start-btn" disabled>▶ Start Drive</button>
+  <button id="drive-stop-btn" style="display:none;">■ Stop</button>
+  <div id="drive-info"></div>
 </div>
 
 <button id="show-console" onclick="document.getElementById('console').classList.remove('collapsed')">Show panel</button>
@@ -839,8 +891,9 @@
   // ------------------------------------------------------------------
   // Route tab: pick origin/destination on the map, find optimal route
   // ------------------------------------------------------------------
-  let pickingMode = null; // 'origin' | 'destination' | null
+  let pickingMode = null; // 'origin' | 'destination' | 'drive-start' | 'drive-end' | null
   let originNode = null, destNode = null;
+  let driveStartNode = null, driveEndNode = null;
   let originMarker = null, destMarker = null, routeLayer = null;
 
   const pickOriginBtn = document.getElementById('pick-origin-btn');
@@ -891,7 +944,12 @@
   map.on('click', (e) => {
     if (!pickingMode) return;
     const node = nearestNode(e.latlng);
-    if (node) setRoutePoint(pickingMode, node);
+    if (!node) return;
+    if (pickingMode === 'origin' || pickingMode === 'destination') {
+      setRoutePoint(pickingMode, node);
+    } else if (pickingMode === 'drive-start' || pickingMode === 'drive-end') {
+      setDrivePoint(pickingMode, node);
+    }
   });
 
   findBtn.addEventListener('click', () => {
@@ -935,6 +993,221 @@
     pickDestBtn.classList.remove('set', 'picking');
     findBtn.disabled = true;
     document.getElementById('route-result').innerHTML = '';
+  });
+
+  // ------------------------------------------------------------------
+  // "Drive from A to B" — smooth animated navigation with live rerouting
+  // ------------------------------------------------------------------
+  const drivePickStartBtn = document.getElementById('drive-pick-start');
+  const drivePickEndBtn = document.getElementById('drive-pick-end');
+  const driveStartBtn = document.getElementById('drive-start-btn');
+  const driveStopBtn = document.getElementById('drive-stop-btn');
+  const driveInfoEl = document.getElementById('drive-info');
+
+  let driveStartMarker = null, driveEndMarker = null, driveRouteLayer = null;
+  let carMarker = null;
+  let driveActive = false;
+  let drivePollTimer = null;
+  let driveAnimHandle = null;
+  let lastKnownReroutes = 0;
+
+  // The most recently-fetched server state, plus the wall-clock time (via
+  // performance.now()) it was fetched at. Every animation frame re-derives
+  // "where is the car right now" from this snapshot instead of waiting for
+  // the next poll — this is what makes the motion continuous instead of
+  // jumping once every poll interval.
+  let driveSnapshot = null;
+  let driveSnapshotFetchedAtMs = 0;
+
+  drivePickStartBtn.addEventListener('click', () => {
+    pickingMode = pickingMode === 'drive-start' ? null : 'drive-start';
+    drivePickStartBtn.classList.toggle('picking', pickingMode === 'drive-start');
+    drivePickEndBtn.classList.remove('picking');
+  });
+  drivePickEndBtn.addEventListener('click', () => {
+    pickingMode = pickingMode === 'drive-end' ? null : 'drive-end';
+    drivePickEndBtn.classList.toggle('picking', pickingMode === 'drive-end');
+    drivePickStartBtn.classList.remove('picking');
+  });
+
+  function setDrivePoint(mode, node) {
+    const icon = L.divIcon({
+      className: '',
+      html: `<div style="width:14px;height:14px;border-radius:50%;background:${mode === 'drive-start' ? '#2ecc71' : '#e74c3c'};border:2px solid #fff;box-shadow:0 0 6px rgba(0,0,0,0.5);"></div>`,
+      iconSize: [14, 14], iconAnchor: [7, 7],
+    });
+    if (mode === 'drive-start') {
+      if (driveStartMarker) map.removeLayer(driveStartMarker);
+      driveStartMarker = L.marker([node.lat, node.lng], { icon }).addTo(map);
+      driveStartNode = node.id;
+      drivePickStartBtn.textContent = `Start: Node ${node.id}`;
+      drivePickStartBtn.classList.add('set');
+      drivePickStartBtn.classList.remove('picking');
+    } else {
+      if (driveEndMarker) map.removeLayer(driveEndMarker);
+      driveEndMarker = L.marker([node.lat, node.lng], { icon }).addTo(map);
+      driveEndNode = node.id;
+      drivePickEndBtn.textContent = `End: Node ${node.id}`;
+      drivePickEndBtn.classList.add('set');
+      drivePickEndBtn.classList.remove('picking');
+    }
+    pickingMode = null;
+    driveStartBtn.disabled = !(driveStartNode && driveEndNode) || driveActive;
+  }
+
+  function bearingDeg(lat1, lng1, lat2, lng2) {
+    const toRad = d => d * Math.PI / 180;
+    const dLng = toRad(lng2 - lng1);
+    const y = Math.sin(dLng) * Math.cos(toRad(lat2));
+    const x = Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) -
+              Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLng);
+    return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+  }
+
+  function ensureCarMarker(lat, lng) {
+    if (carMarker) return carMarker;
+    const icon = L.divIcon({
+      className: '', html: `<div class="car-triangle"></div>`,
+      iconSize: [16, 18], iconAnchor: [8, 10],
+    });
+    carMarker = L.marker([lat, lng], { icon, interactive: false, zIndexOffset: 1000 }).addTo(map);
+    return carMarker;
+  }
+
+  function setCarBearing(deg) {
+    if (!carMarker) return;
+    const el = carMarker.getElement();
+    const tri = el && el.querySelector('.car-triangle');
+    if (tri) tri.style.transform = `rotate(${deg}deg)`;
+  }
+
+  // ---- continuous animation loop (requestAnimationFrame) ----------------
+  function driveAnimTick() {
+    if (!driveActive || !driveSnapshot || !driveSnapshot.current_edge) {
+      driveAnimHandle = null;
+      return;
+    }
+    const ce = driveSnapshot.current_edge;
+    const [ulng, ulat] = ce.u_coords;
+    const [vlng, vlat] = ce.v_coords;
+
+    // Extrapolate "sim time right now" from wall-clock elapsed since the
+    // snapshot was fetched, using the server's own tick_seconds <->
+    // sim_minutes_per_tick ratio — this is what lets the car keep moving
+    // smoothly between polls instead of only updating once per poll.
+    const elapsedMs = performance.now() - driveSnapshotFetchedAtMs;
+    const simMinPerRealMs = driveSnapshot.sim_minutes_per_tick / (driveSnapshot.tick_seconds * 1000);
+    const estSimNow = driveSnapshot.sim_clock_min + elapsedMs * simMinPerRealMs;
+
+    const span = Math.max(ce.exit_time_min - ce.enter_time_min, 1e-6);
+    const frac = Math.min(Math.max((estSimNow - ce.enter_time_min) / span, 0), 1);
+
+    const lat = ulat + (vlat - ulat) * frac;
+    const lng = ulng + (vlng - ulng) * frac;
+
+    ensureCarMarker(lat, lng).setLatLng([lat, lng]);
+    setCarBearing(bearingDeg(ulat, ulng, vlat, vlng));
+
+    driveAnimHandle = requestAnimationFrame(driveAnimTick);
+  }
+
+  function renderDriveRoute(geoCoords) {
+    if (driveRouteLayer) map.removeLayer(driveRouteLayer);
+    const latlngs = geoCoords.map(([lng, lat]) => [lat, lng]);
+    driveRouteLayer = L.polyline(latlngs, {
+      color: '#00e5ff', weight: 6, opacity: 0.9, dashArray: null,
+    }).addTo(map);
+  }
+
+  function updateDriveInfo(state) {
+    if (state.reroute_count > lastKnownReroutes) {
+      driveInfoEl.innerHTML = `<span class="reroute-flash">↻ Rerouted (road ahead changed)</span>`;
+      setTimeout(() => renderDriveInfoNormal(state), 1800);
+    } else {
+      renderDriveInfoNormal(state);
+    }
+    lastKnownReroutes = state.reroute_count;
+  }
+
+  function renderDriveInfoNormal(state) {
+    const km = (state.distance_remaining_m / 1000).toFixed(2);
+    driveInfoEl.innerHTML =
+      `<span>ETA <b>${state.eta_min.toFixed(1)} min</b></span>` +
+      `<span>${km} km left</span>` +
+      `<span>Rerouted <b>${state.reroute_count}×</b></span>`;
+  }
+
+  // ---- server polling: fetches fresh route/edge state, feeds the rAF loop -
+  function pollDriveState() {
+    fetch('/api/drive/state')
+      .then(res => res.json())
+      .then(state => {
+        if (!state.active) {
+          finishDrive(state.status === 'arrived' ? 'Arrived!' : 'No route available — stopped.');
+          return;
+        }
+        driveSnapshot = state;
+        driveSnapshotFetchedAtMs = performance.now();
+        renderDriveRoute(state.route_geometry.coordinates);
+        updateDriveInfo(state);
+        if (!driveAnimHandle) driveAnimHandle = requestAnimationFrame(driveAnimTick);
+      })
+      .catch(() => {});
+  }
+
+  function finishDrive(message) {
+    driveActive = false;
+    if (drivePollTimer) { clearInterval(drivePollTimer); drivePollTimer = null; }
+    if (driveAnimHandle) { cancelAnimationFrame(driveAnimHandle); driveAnimHandle = null; }
+    driveInfoEl.innerHTML = `<b>${message}</b>`;
+    driveStartBtn.style.display = '';
+    driveStopBtn.style.display = 'none';
+    driveStartBtn.disabled = !(driveStartNode && driveEndNode);
+    setTimeout(() => {
+      if (driveActive) return;
+      driveInfoEl.innerHTML = '';
+      if (carMarker) { map.removeLayer(carMarker); carMarker = null; }
+      if (driveRouteLayer) { map.removeLayer(driveRouteLayer); driveRouteLayer = null; }
+    }, 4000);
+  }
+
+  driveStartBtn.addEventListener('click', () => {
+    if (!driveStartNode || !driveEndNode) return;
+    driveStartBtn.disabled = true;
+    driveStartBtn.textContent = 'Routing…';
+    fetch('/api/drive/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: driveStartNode, target: driveEndNode }),
+    })
+      .then(res => res.json())
+      .then(state => {
+        driveStartBtn.textContent = '▶ Start Drive';
+        if (state.error) {
+          driveInfoEl.innerHTML = `<span>${state.error}</span>`;
+          driveStartBtn.disabled = false;
+          return;
+        }
+        driveActive = true;
+        lastKnownReroutes = 0;
+        driveStartBtn.style.display = 'none';
+        driveStopBtn.style.display = '';
+        driveSnapshot = state;
+        driveSnapshotFetchedAtMs = performance.now();
+        if (state.route_geometry) renderDriveRoute(state.route_geometry.coordinates);
+        if (state.eta_min != null) renderDriveInfoNormal(state);
+        if (!driveAnimHandle) driveAnimHandle = requestAnimationFrame(driveAnimTick);
+        drivePollTimer = setInterval(pollDriveState, 1000);
+      })
+      .catch(() => {
+        driveStartBtn.textContent = '▶ Start Drive';
+        driveStartBtn.disabled = false;
+      });
+  });
+
+  driveStopBtn.addEventListener('click', () => {
+    fetch('/api/drive/stop', { method: 'POST' }).then(() => finishDrive('Stopped.'));
+    if (carMarker) { map.removeLayer(carMarker); carMarker = null; }
+    if (driveRouteLayer) { map.removeLayer(driveRouteLayer); driveRouteLayer = null; }
   });
 
   // ------------------------------------------------------------------
@@ -1060,8 +1333,10 @@
           nodeLayers.set(id, marker);
           nodeCoords.push({ id, lat: latlng.lat, lng: latlng.lng });
           marker.on('click', () => {
-            if (pickingMode) {
+            if (pickingMode === 'origin' || pickingMode === 'destination') {
               setRoutePoint(pickingMode, { id, lat: latlng.lat, lng: latlng.lng });
+            } else if (pickingMode === 'drive-start' || pickingMode === 'drive-end') {
+              setDrivePoint(pickingMode, { id, lat: latlng.lat, lng: latlng.lng });
             } else {
               openNodePopup(id, latlng);
             }

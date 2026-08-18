@@ -89,6 +89,114 @@ EdgeKey = Tuple[object, object, object]  # (u, v, k) — matches nx MultiDiGraph
 JAM_DENSITY_PER_LANE = 160.0          # veh/km/lane at gridlock (typical urban value)
 CAPACITY_PER_LANE_PER_HOUR = 1800.0   # must match virtual_world.py's constant
 
+# ===========================================================================
+# 1b. "DRIVE" ROUTING  (A* with an admissible heuristic + marginal-cost term)
+# ===========================================================================
+# This is the routing used by the single "drive from A to B" feature (as
+# opposed to the background simulation's plain Dijkstra, which is fine for
+# thousands of anonymous background trips but doesn't need to be the most
+# sophisticated algorithm available).
+#
+# Algorithm choice: A* (Hart, Nilsson & Raphael, 1968) instead of plain
+# Dijkstra. A* is the same algorithm family production routers (OSRM,
+# GraphHopper, Valhalla) build on before their contraction-hierarchy
+# pre-processing layer — with an admissible heuristic it explores far fewer
+# nodes than Dijkstra while still guaranteeing the optimal path under the
+# given edge-cost function. The heuristic used here is straight-line
+# (great-circle) distance to the target divided by the fastest possible
+# speed anywhere on the network — a true lower bound on remaining travel
+# time, which is exactly what "admissible" requires for A* to stay optimal.
+#
+# Cost function choice: not raw distance, and not just this driver's own
+# congestion-adjusted travel time (`weight`, already BPR + signal-delay
+# aware) — an extra MARGINAL-COST externality term is added on top. This
+# approximates System-Optimal routing (Beckmann et al., 1956): a link
+# that's already heavily loaded gets penalised *more* than its own average
+# travel time implies, so the router leans away from piling additional
+# load onto already-congested links even when that link still looks like
+# "your" fastest option — nudging one more trip toward the flow pattern a
+# city-wide Frank-Wolfe System-Optimal assignment (see section 8 below)
+# would prefer, without needing to re-solve the full network equilibrium
+# for every single route request.
+EARTH_RADIUS_KM = 6371.0009
+MAX_NETWORK_SPEED_KMH = 100.0   # admissible upper bound used for the A* heuristic
+SYSTEM_AWARE_GAMMA = 1.6        # externality strength
+SYSTEM_AWARE_BETA = 2.0         # externality grows with the square of congestion
+REROUTE_IMPROVEMENT_MARGIN_MIN = 0.25  # ignore reroutes worth less than this (avoid thrashing)
+REROUTE_CHECK_INTERVAL_MIN = 0.5       # minimum sim-time between route re-checks (perf + stability)
+
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    """Great-circle distance between two lat/lon points, in kilometres."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * EARTH_RADIUS_KM * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _make_astar_heuristic(G: nx.MultiDiGraph, target):
+    """Admissible lower-bound heuristic (minutes) for nx.astar_path: great-circle
+    distance to the target at the fastest speed the network could ever offer."""
+    ty, tx = G.nodes[target]["y"], G.nodes[target]["x"]
+
+    def h(n, _target=None):
+        # networkx calls this as heuristic(node, target); target is already
+        # closed over above, so the second positional arg is accepted but unused.
+        ny, nx_ = G.nodes[n]["y"], G.nodes[n]["x"]
+        dist_km = _haversine_km(ny, nx_, ty, tx)
+        return (dist_km / MAX_NETWORK_SPEED_KMH) * 60.0
+
+    return h
+
+
+def _system_aware_edge_cost(data: Dict) -> float:
+    """weight (own congestion-adjusted travel time) + a marginal-cost
+    externality term that grows with how congested the link already is."""
+    base = data.get("weight", data.get("free_flow_time_min", 0.5))
+    congestion = max(data.get("congestion_score", 0.0), 0.0)
+    externality = SYSTEM_AWARE_GAMMA * base * (congestion ** SYSTEM_AWARE_BETA)
+    return base + externality
+
+
+def _make_system_aware_weight():
+    """
+    Weight function for nx.astar_path/dijkstra on a MultiDiGraph. NetworkX
+    calls a *callable* weight as weight(u, v, d) where `d` is the dict of
+    ALL parallel edges between u and v (keyed by edge key) — not a single
+    edge's attributes — so this must pick the cheapest parallel edge itself.
+    """
+    def weight_fn(u, v, d):
+        return min(_system_aware_edge_cost(data) for data in d.values())
+    return weight_fn
+
+
+def _cheapest_parallel_key(G: nx.MultiDiGraph, u, v):
+    parallel = G[u][v]
+    return min(parallel, key=lambda kk: _system_aware_edge_cost(parallel[kk]))
+
+
+def find_drive_route(G: nx.MultiDiGraph, source, target) -> Optional[List[EdgeKey]]:
+    """
+    Compute the best A-to-B route using A* with the admissible haversine
+    heuristic and the marginal-cost-aware edge weight described above.
+    Returns a list of (u, v, k) edges, or None if no route currently exists
+    (e.g. the network is disconnected around a closure).
+    """
+    if source not in G or target not in G:
+        return None
+    if source == target:
+        return []
+    try:
+        node_path = nx.astar_path(
+            G, source, target,
+            heuristic=_make_astar_heuristic(G, target),
+            weight=_make_system_aware_weight(),
+        )
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        return None
+    return [(u, v, _cheapest_parallel_key(G, u, v)) for u, v in zip(node_path[:-1], node_path[1:])]
+
 
 def fd_params(free_flow_speed_kmh: float) -> Tuple[float, float, float]:
     """Return (critical_density, jam_density, backward_wave_speed) for a lane."""
@@ -405,6 +513,35 @@ class Vehicle:
         return self.route[self.edge_idx]
 
 
+@dataclass
+class DriveSession:
+    """
+    The single user-driven 'drive from A to B' trip (distinct from the
+    anonymous background Vehicle population). Progresses through
+    `path_edges` using the exact same enter/exit-time mechanics as a
+    background Vehicle (see `_enter_edge`/`_advance_vehicles`), so its
+    motion is governed by the same live physics — but it is re-evaluated
+    against the live graph every tick so it can react to closures/jams
+    that appear ahead of it (see `TrafficSimulation._advance_drive`).
+    """
+    source: object
+    target: object
+    path_edges: List[EdgeKey] = field(default_factory=list)
+    edge_idx: int = 0
+    enter_time_min: float = 0.0
+    exit_time_min: float = 0.0
+    status: str = "active"      # active | arrived | unreachable
+    reroute_count: int = 0
+    created_at_min: float = 0.0
+    last_reroute_check_min: float = float("-inf")
+
+    @property
+    def current_edge(self) -> Optional[EdgeKey]:
+        if 0 <= self.edge_idx < len(self.path_edges):
+            return self.path_edges[self.edge_idx]
+        return None
+
+
 # ===========================================================================
 # 7. THE SIMULATION ENGINE
 # ===========================================================================
@@ -482,6 +619,10 @@ class TrafficSimulation:
 
         self._green_wave: Dict[object, Tuple[EdgeKey, float]] = {}  # node -> (favored edge, expires_at_min)
 
+        # The single active user-driven "drive from A to B" session, if any
+        # (see DriveSession / start_drive / _advance_drive below).
+        self.drive: Optional[DriveSession] = None
+
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._running = False
@@ -528,6 +669,7 @@ class TrafficSimulation:
             self._expire_overrides()
             self._spawn_vehicles()
             self._advance_vehicles()
+            self._advance_drive()
             self._update_signals()
             self._update_edge_states()
 
@@ -825,6 +967,161 @@ class TrafficSimulation:
                 self._route_edges(path_nodes[0], path_nodes[-1]) or [], is_emergency=True
             ) if len(path_nodes) >= 2 else None
             return veh
+
+    # ---- "drive from A to B" session --------------------------------------
+    def _path_weight(self, edges: List[EdgeKey]) -> float:
+        """Sum of live routing `weight` (minutes) across a list of edges.
+        A missing/now-invalid edge is treated as very expensive rather than
+        raising, so a stale cached path degrades gracefully into "reroute
+        immediately" instead of crashing the sim loop."""
+        total = 0.0
+        for (u, v, k) in edges:
+            if v in self.G[u] and k in self.G[u][v]:
+                total += self.G[u][v][k].get("weight", 1e6)
+            else:
+                total += 1e6
+        return total
+
+    def start_drive(self, source, target) -> Dict:
+        """
+        Start (or replace) the single active drive session: compute the
+        best A-to-B route with `find_drive_route` (A* + marginal-cost
+        weighting — see section 1b) and begin progressing it using the
+        same tick-based enter/exit-time mechanics as background vehicles.
+        """
+        with self._lock:
+            edges = find_drive_route(self.G, source, target)
+            if edges is None:
+                self.drive = None
+                return {"active": False, "status": "unreachable"}
+            self.drive = DriveSession(source=source, target=target, path_edges=edges,
+                                       created_at_min=self.sim_clock_min)
+            if not edges:  # source == target
+                self.drive.status = "arrived"
+                return self._drive_state_locked()
+            self._drive_enter_edge(edges[0], self.sim_clock_min)
+            return self._drive_state_locked()
+
+    def stop_drive(self) -> None:
+        with self._lock:
+            self.drive = None
+
+    def _drive_enter_edge(self, edge: EdgeKey, now: float) -> None:
+        u, v, k = edge
+        data = self.G[u][v][k]
+        travel_time_min = max(data.get("weight", data.get("free_flow_time_min", 0.5)), 0.05)
+        self.drive.enter_time_min = now
+        self.drive.exit_time_min = now + travel_time_min
+
+    def _advance_drive(self) -> None:
+        """Called once per tick (already inside self._lock via tick()).
+        Progresses the active drive session and re-checks the route ahead
+        of it against the live graph every tick, so a road block/jam that
+        appears anywhere downstream is reacted to immediately — without
+        interrupting whichever edge is currently being driven (the same
+        behaviour a real turn-by-turn navigation app has: it recalculates
+        the rest of the trip, it doesn't teleport you off your current
+        road)."""
+        d = self.drive
+        if d is None or d.status != "active":
+            return
+        now = self.sim_clock_min
+
+        guard = 0
+        while d.exit_time_min <= now and guard < 25:
+            guard += 1
+            d.edge_idx += 1
+            if d.edge_idx >= len(d.path_edges):
+                d.status = "arrived"
+                return
+            self._drive_enter_edge(d.path_edges[d.edge_idx], d.exit_time_min)
+
+        current_edge = d.current_edge
+        if current_edge is None:
+            d.status = "arrived"
+            return
+        _, v, _ = current_edge
+
+        # Re-check the route ahead only when we just moved onto a new edge,
+        # or enough sim-time has passed since the last check — not on every
+        # single tick. This avoids A*-ing every tick (real cost on a large
+        # real-city graph) and avoids visibly flip-flopping the highlighted
+        # route between two near-identical-cost paths as background traffic
+        # causes tiny weight fluctuations.
+        just_changed_edge = guard > 0
+        due_for_check = (now - d.last_reroute_check_min) >= REROUTE_CHECK_INTERVAL_MIN
+        if not (just_changed_edge or due_for_check):
+            return
+        d.last_reroute_check_min = now
+
+        remaining_after_current = d.path_edges[d.edge_idx + 1:]
+        remaining_weight = self._path_weight(remaining_after_current)
+
+        alt_edges = find_drive_route(self.G, v, d.target)
+        if alt_edges is None:
+            # Only give up if the destination is genuinely unreachable from
+            # here right now; a transient closure that still leaves *some*
+            # path should just make the alternative more expensive, not None.
+            if not remaining_after_current:
+                d.status = "unreachable"
+            return
+
+        alt_weight = self._path_weight(alt_edges)
+        if alt_weight < remaining_weight - REROUTE_IMPROVEMENT_MARGIN_MIN:
+            d.path_edges = d.path_edges[:d.edge_idx + 1] + alt_edges
+            d.reroute_count += 1
+
+    def get_drive_state(self) -> Dict:
+        with self._lock:
+            return self._drive_state_locked()
+
+    def _drive_state_locked(self) -> Dict:
+        d = self.drive
+        if d is None:
+            return {"active": False}
+        if d.status == "unreachable":
+            return {"active": False, "status": "unreachable", "reroute_count": d.reroute_count}
+        if d.status == "arrived" or d.current_edge is None:
+            return {"active": False, "status": "arrived", "reroute_count": d.reroute_count}
+
+        u, v, k = d.current_edge
+        edata = self.G[u][v][k]
+        u_node, v_node = self.G.nodes[u], self.G.nodes[v]
+        remaining_edges = d.path_edges[d.edge_idx:]
+
+        geometry = [[u_node["x"], u_node["y"]]]
+        for (_a, b, _k) in remaining_edges:
+            bn = self.G.nodes[b]
+            geometry.append([bn["x"], bn["y"]])
+
+        elapsed_on_current = max(self.sim_clock_min - d.enter_time_min, 0.0)
+        eta_min = max(self._path_weight(remaining_edges) - elapsed_on_current, 0.0)
+        distance_remaining_m = sum(
+            self.G[a][b][kk].get("length", 0.0) for (a, b, kk) in remaining_edges
+        )
+
+        return {
+            "active": True,
+            "status": "active",
+            "source": str(d.source),
+            "target": str(d.target),
+            "sim_clock_min": round(self.sim_clock_min, 3),
+            "tick_seconds": self.tick_seconds,
+            "sim_minutes_per_tick": self.dt_min,
+            "current_edge": {
+                "u": str(u), "v": str(v), "k": str(k),
+                "u_coords": [u_node["x"], u_node["y"]],
+                "v_coords": [v_node["x"], v_node["y"]],
+                "enter_time_min": round(d.enter_time_min, 3),
+                "exit_time_min": round(d.exit_time_min, 3),
+                "congestion_score": edata.get("congestion_score"),
+                "current_speed_kmh": edata.get("current_speed_kmh"),
+            },
+            "route_geometry": {"type": "LineString", "coordinates": geometry},
+            "eta_min": round(eta_min, 2),
+            "distance_remaining_m": round(distance_remaining_m, 1),
+            "reroute_count": d.reroute_count,
+        }
 
     # ---- live vehicle positions (for map animation) ----------------------
     def _apply_override_now(self, edge: EdgeKey):

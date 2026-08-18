@@ -808,6 +808,50 @@ def api_simulate_emergency():
     return jsonify({"scheduled_nodes": len(path), "vehicle_id": veh.vid if veh else None})
 
 
+@app.route("/api/drive/start", methods=["POST"])
+def api_drive_start():
+    """
+    Body: {"source": <node id>, "target": <node id>}
+    Starts (or replaces) the single 'drive from A to B' session, routed with
+    traffic_engine.find_drive_route — A* with an admissible haversine
+    heuristic plus a marginal-cost congestion term, so the route accounts
+    for both this driver's own travel time AND the impact of adding this
+    trip to already-congested links (see traffic_engine.py section 1b for
+    the full rationale). Returns the same shape as GET /api/drive/state.
+    """
+    body = request.get_json(silent=True) or {}
+    raw_source, raw_target = body.get("source"), body.get("target")
+    if raw_source is None or raw_target is None:
+        return jsonify({"error": "source and target node ids are required"}), 400
+    source = int(raw_source) if str(raw_source).lstrip("-").isdigit() else raw_source
+    target = int(raw_target) if str(raw_target).lstrip("-").isdigit() else raw_target
+    if source not in ROAD_GRAPH or target not in ROAD_GRAPH:
+        return jsonify({"error": "unknown source/target node id"}), 404
+
+    state = SIM.start_drive(source, target)
+    if not state.get("active") and state.get("status") not in ("arrived",):
+        return jsonify({"error": "no route currently exists between these nodes"}), 404
+    return jsonify(state)
+
+
+@app.route("/api/drive/stop", methods=["POST"])
+def api_drive_stop():
+    SIM.stop_drive()
+    return jsonify({"status": "stopped"})
+
+
+@app.route("/api/drive/state")
+def api_drive_state():
+    """
+    Polled continuously by the frontend while a drive is active. Along with
+    the current edge's endpoints/enter/exit sim-times, this returns
+    tick_seconds/sim_minutes_per_tick so the client can locally extrapolate
+    the car's position between polls (smooth animation) instead of only
+    ever snapping to a new spot once per poll.
+    """
+    return jsonify(SIM.get_drive_state())
+
+
 @app.route("/api/forecast")
 def api_forecast():
     """Example: /api/forecast?u=12&v=48&k=0&horizons=15,30,60"""
