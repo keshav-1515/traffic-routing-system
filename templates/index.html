@@ -76,6 +76,12 @@
     width: 7px; height: 7px; border-radius: 50%; background: var(--low);
     box-shadow: 0 0 0 3px rgba(46,204,113,0.15);
     animation: pulse 2.4s ease-in-out infinite;
+    cursor: pointer;
+  }
+  .live-dot.paused {
+    background: var(--text-faint);
+    box-shadow: 0 0 0 3px rgba(92,101,119,0.15);
+    animation: none;
   }
   @media (prefers-reduced-motion: reduce) { .live-dot { animation: none; } }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
@@ -265,7 +271,7 @@
       <span class="eyebrow">City Road Network</span>
       <h1>Traffic Control</h1>
     </div>
-    <span class="live-dot" title="Simulation live"></span>
+    <span class="live-dot" id="live-dot" title="Click to pause/resume the live simulation"></span>
   </div>
 
   <div class="tabs" role="tablist">
@@ -292,6 +298,16 @@
       <div class="stat-row"><span class="k">Nodes</span><span class="v" id="node-count">–</span></div>
       <div class="stat-row"><span class="k">Road segments</span><span class="v" id="edge-count">–</span></div>
       <div id="source-badge" class="badge">loading…</div>
+
+      <div class="legend" style="margin-top:14px;">
+        <div class="section-label">Live simulation</div>
+        <div class="stat-row"><span class="k">Sim clock</span><span class="v" id="sim-clock">–</span></div>
+        <div class="stat-row"><span class="k">Active vehicles</span><span class="v" id="sim-vehicles">–</span></div>
+        <div class="stat-row"><span class="k">Trips completed</span><span class="v" id="sim-trips">–</span></div>
+        <div class="stat-row"><span class="k">Avg travel time</span><span class="v" id="sim-avgtime">–</span></div>
+        <div class="stat-row"><span class="k">Active incidents</span><span class="v" id="sim-incidents">–</span></div>
+        <div class="stat-row"><span class="k">CO₂ emitted</span><span class="v" id="sim-co2">–</span></div>
+      </div>
 
       <div class="legend">
         <div class="section-label" style="margin-top:14px;">Congestion legend</div>
@@ -395,8 +411,7 @@
   }
 
   // ------------------------------------------------------------------
-  // Console UI: tabs, collapse toggle, selection readout, mock controls.
-  // Purely presentational — no simulation/backend logic is wired up yet.
+  // Console UI: tabs + collapse toggle (purely presentational)
   // ------------------------------------------------------------------
   const consoleEl = document.getElementById('console');
   document.getElementById('console-toggle').addEventListener('click', () => {
@@ -413,33 +428,141 @@
     });
   });
 
+  // ------------------------------------------------------------------
+  // Live simulation controls — everything below actually talks to the
+  // traffic_engine.TrafficSimulation running in the Flask process.
+  // ------------------------------------------------------------------
+  let simRunning = true;
+  const liveDot = document.getElementById('live-dot');
+  liveDot.addEventListener('click', () => {
+    const endpoint = simRunning ? '/api/simulate/stop' : '/api/simulate/start';
+    fetch(endpoint, { method: 'POST' })
+      .then(res => res.json())
+      .then(data => {
+        simRunning = data.running;
+        liveDot.classList.toggle('paused', !simRunning);
+        liveDot.title = simRunning ? 'Simulation live — click to pause' : 'Simulation paused — click to resume';
+      });
+  });
+
   const densitySlider = document.getElementById('density-slider');
   const densityValue = document.getElementById('density-value');
+  let densityDebounce = null;
   densitySlider.addEventListener('input', () => {
     densityValue.textContent = `${densitySlider.value}%`;
+    clearTimeout(densityDebounce);
+    // 50% on the slider = demand_scale 1.0 (the simulation's own baseline);
+    // 0-200% maps onto demand_scale 0-4, matching TrafficSimulation.set_demand_scale.
+    const scale = (densitySlider.value / 50);
+    densityDebounce = setTimeout(() => {
+      fetch('/api/simulate/demand', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scale }),
+      });
+    }, 250);
   });
+
+  // Currently-selected road segment (u, v, k) — set by clicking a road,
+  // read by the Control tab's action buttons below.
+  let selectedEdge = null;
+
+  function updateSelectedBox(props) {
+    selectedEdge = { u: props.u, v: props.v, k: props.k };
+    const box = document.getElementById('selected-box');
+    box.innerHTML = `
+      <div class="road-name">${props.highway}</div>
+      <div class="road-meta">Lanes ${props.lanes} · ${props.length_m} m · ${props.free_flow_time_min} min free-flow</div>
+      <div class="road-meta">Congestion score ${props.congestion_score} · ${props.current_speed_kmh ?? '–'} km/h</div>
+    `;
+  }
+
+  function postJSON(url, body) {
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    }).then(res => res.json());
+  }
 
   document.querySelectorAll('.action-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       const alreadyArmed = btn.classList.contains('armed');
       btn.parentElement.querySelectorAll('.action-btn').forEach((b) => b.classList.remove('armed'));
-      if (!alreadyArmed) btn.classList.add('armed');
+      if (!selectedEdge) return;
+      const { u, v, k } = selectedEdge;
+
+      if (btn.dataset.arm === 'jam') {
+        postJSON('/api/simulate/incident', { u, v, k, kind: 'manual_jam', duration_min: 15, capacity_factor: 0.35 });
+        if (!alreadyArmed) btn.classList.add('armed');
+      } else if (btn.dataset.arm === 'block') {
+        postJSON('/api/simulate/closure', { u, v, k, closed: !alreadyArmed });
+        if (!alreadyArmed) btn.classList.add('armed');
+      } else if (btn.dataset.arm === 'peak') {
+        postJSON('/api/simulate/incident', { u, v, k, kind: 'peak_surge', duration_min: 30, capacity_factor: 0.5 });
+        if (!alreadyArmed) btn.classList.add('armed');
+      } else if (btn.dataset.arm === 'clear') {
+        postJSON('/api/simulate/closure', { u, v, k, closed: false });
+      }
     });
   });
 
-  function updateSelectedBox(props) {
-    const box = document.getElementById('selected-box');
-    box.innerHTML = `
-      <div class="road-name">${props.highway}</div>
-      <div class="road-meta">Lanes ${props.lanes} · ${props.length_m} m · ${props.free_flow_time_min} min free-flow</div>
-      <div class="road-meta">Congestion score ${props.congestion_score}</div>
-    `;
+  // ------------------------------------------------------------------
+  // Map layers. Graph geometry/topology is fetched once; congestion,
+  // speed, and queue values are then refreshed every few seconds from
+  // /api/simulate/state without re-drawing the geometry, so the map
+  // visibly "breathes" as the live simulation evolves.
+  // ------------------------------------------------------------------
+  const edgeLayers = new Map();   // "u-v-k" -> leaflet layer
+  let firstLoad = true;
+
+  function applyEdgeState(key, state) {
+    const layer = edgeLayers.get(key);
+    if (!layer || !state) return;
+    layer.setStyle({ color: congestionColor(state.congestion_score), opacity: state.incident ? 1 : 0.85,
+      dashArray: state.incident ? '4 3' : null });
+  }
+
+  function refreshSimState() {
+    fetch('/api/simulate/state')
+      .then(res => res.json())
+      .then(data => {
+        simRunning = data.running;
+        liveDot.classList.toggle('paused', !simRunning);
+
+        document.getElementById('sim-clock').textContent = data.sim_day_hhmm;
+        document.getElementById('sim-vehicles').textContent = data.active_vehicles;
+        document.getElementById('sim-trips').textContent = data.trips_completed;
+        document.getElementById('sim-avgtime').textContent = data.avg_travel_time_min != null ? `${data.avg_travel_time_min} min` : '–';
+        document.getElementById('sim-incidents').textContent = data.active_incidents.length;
+        document.getElementById('sim-co2').textContent = `${data.total_co2_kg} kg`;
+
+        const avgPct = Math.round(Math.min(data.avg_network_load, 1) * 100);
+        document.getElementById('load-gauge').style.setProperty('--pct', avgPct);
+        document.getElementById('load-value').textContent = `${avgPct}%`;
+
+        for (const [key, state] of Object.entries(data.edges)) {
+          applyEdgeState(key, state);
+        }
+
+        // Keep the selected-segment readout live too, in case it's the
+        // one currently being watched in the Control tab.
+        if (selectedEdge) {
+          const key = `${selectedEdge.u}-${selectedEdge.v}-${selectedEdge.k}`;
+          const s = data.edges[key];
+          if (s) {
+            const box = document.getElementById('selected-box');
+            const meta = box.querySelector('.road-meta:last-of-type');
+            if (meta) meta.textContent = `Congestion score ${s.congestion_score} · ${s.current_speed_kmh} km/h`;
+          }
+        }
+      })
+      .catch(err => console.error('simulate/state poll failed', err));
   }
 
   // ------------------------------------------------------------------
-  // All the actual graph-building, enrichment, and scoring happens in
-  // Python (virtual_world.py). The frontend just requests the finished
-  // GeoJSON and draws it.
+  // Graph geometry/topology fetched once from Python (virtual_world.py);
+  // live values are then layered on top by refreshSimState() above.
   // ------------------------------------------------------------------
   fetch('/api/graph')
     .then(res => res.json())
@@ -456,8 +579,6 @@
         badge.classList.add('real');
       }
 
-      // Drive the network-load gauge from the same congestion scores
-      // used to color the map — purely a different view of existing data.
       const scores = data.edges.features
         .map(f => f.properties.congestion_score)
         .filter(s => typeof s === 'number');
@@ -476,6 +597,7 @@
         }),
         onEachFeature: (feature, layer) => {
           const p = feature.properties;
+          edgeLayers.set(`${p.u}-${p.v}-${p.k}`, layer);
           layer.bindPopup(
             `<b>${p.highway}</b><br>` +
             `Lanes: ${p.lanes}<br>` +
@@ -484,9 +606,6 @@
             `Capacity: ${p.capacity_veh_per_hr} veh/hr<br>` +
             `Congestion score: ${p.congestion_score}`
           );
-          // Mirror the same info into the Control tab's selection readout
-          // and switch to that tab so the click feels like "selecting" the
-          // road for the (not-yet-wired) density/jam/roadblock controls.
           layer.on('click', () => {
             updateSelectedBox(p);
             document.querySelector('.tab[data-tab="control"]').click();
@@ -505,6 +624,12 @@
             fillOpacity: 0.9,
           }),
       }).addTo(map);
+
+      if (firstLoad) {
+        firstLoad = false;
+        refreshSimState();
+        setInterval(refreshSimState, 3000);
+      }
     })
     .catch(err => {
       document.getElementById('source-badge').textContent = 'Failed to load graph';

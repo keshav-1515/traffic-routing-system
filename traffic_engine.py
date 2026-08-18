@@ -1,0 +1,947 @@
+"""
+Traffic Engine — the "AI / simulation brain" of the dashboard
+================================================================
+This module owns everything the plan calls "core traffic AI logic":
+dynamic congestion evolution, signal control (fixed / rule-based-adaptive /
+Q-learning), incident injection, emergency green-waves, short-horizon
+forecasting, emissions estimation, and a Frank-Wolfe static traffic
+assignment engine for "what-if" counterfactual analysis.
+
+It is deliberately dependency-free (stdlib + networkx only) so it drops
+into virtual_world.py's Flask process and runs a live background thread.
+
+It does NOT build or own the road graph — virtual_world.py does that.
+This module receives the already-built `networkx.MultiDiGraph` and
+mutates the same edge-attribute dictionaries virtual_world.py created
+(`congestion_score`, `weight`, `current_volume`, ...), so every existing
+API route (`/api/graph`, `/api/route`) automatically reflects the live
+simulation with zero changes to those routes.
+
+--------------------------------------------------------------------------
+1. TRAFFIC FLOW MODEL — triangular fundamental diagram + link-based CTM
+--------------------------------------------------------------------------
+Each road edge is treated as one macroscopic "cell" (a standard, widely
+used simplification of the Cell Transmission Model — Daganzo, 1994 — for
+network-scale simulation where per-metre discretisation is unnecessary).
+
+For a lane with free-flow speed vf and per-lane capacity qmax:
+    critical density   kc = qmax / vf                  (veh/km/lane)
+    jam density         kj = JAM_DENSITY_PER_LANE        (veh/km/lane)
+    backward wave speed w  = qmax / (kj - kc)            (km/h)
+
+    speed(k) = vf                          if k <= kc   (free-flow branch)
+             = w * (kj - k) / k            if k >  kc   (congested branch)
+
+This is the standard triangular flow-density relationship used in
+production-grade CTM/LTM traffic simulators, and it is what gives the
+simulation *realistic* behaviour: flow rises linearly with density up to
+capacity, then speed collapses as density keeps climbing toward gridlock,
+exactly like real congestion waves.
+
+--------------------------------------------------------------------------
+2. DEMAND — time-of-day Poisson trip generation + dynamic route choice
+--------------------------------------------------------------------------
+Trips are generated as a non-homogeneous Poisson process whose rate
+follows a two-peak (AM/PM commute) diurnal curve. Each trip is assigned
+the current shortest-time path (Dijkstra over the live, congestion-aware
+`weight` attribute) — the same behaviour as a real-time navigation app,
+which is what actually produces emergent congestion: vehicles pile onto
+whichever route currently looks fastest.
+
+--------------------------------------------------------------------------
+3. SIGNALS — Webster's delay formula + 3 controller strategies
+--------------------------------------------------------------------------
+Every intersection with >= 3 approaches gets a 2-phase signal. Whichever
+controller is active decides the green split; the resulting intersection
+delay is computed with Webster's uniform-delay formula (Webster, 1958),
+the textbook method traffic engineers use to convert cycle length / green
+ratio / degree-of-saturation into an expected delay per vehicle. That
+delay is added on top of the BPR link travel time, so a fixed-time signal
+producing bad splits will visibly worsen congestion on the map, and an
+adaptive controller correcting the split will visibly relieve it.
+
+--------------------------------------------------------------------------
+4. WHAT-IF ANALYSIS — Frank-Wolfe static User Equilibrium assignment
+--------------------------------------------------------------------------
+`run_frank_wolfe` is a standalone, independent traffic-assignment solver
+(the algorithm the plan explicitly names). It is used for counterfactual
+"before vs after" analysis (e.g. "what happens if I close this road?")
+and does not touch the live simulation state.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+import networkx as nx
+
+EdgeKey = Tuple[object, object, object]  # (u, v, k) — matches nx MultiDiGraph edges
+
+# ===========================================================================
+# 1. FUNDAMENTAL DIAGRAM  (triangular flow-density relationship)
+# ===========================================================================
+JAM_DENSITY_PER_LANE = 160.0          # veh/km/lane at gridlock (typical urban value)
+CAPACITY_PER_LANE_PER_HOUR = 1800.0   # must match virtual_world.py's constant
+
+
+def fd_params(free_flow_speed_kmh: float) -> Tuple[float, float, float]:
+    """Return (critical_density, jam_density, backward_wave_speed) for a lane."""
+    vf = max(free_flow_speed_kmh, 5.0)
+    kc = CAPACITY_PER_LANE_PER_HOUR / vf
+    kj = JAM_DENSITY_PER_LANE
+    if kj <= kc:
+        kj = kc * 1.5
+    w = CAPACITY_PER_LANE_PER_HOUR / (kj - kc)
+    return kc, kj, w
+
+
+def fd_speed(density_per_lane: float, vf_kmh: float, kc: float, kj: float, w: float) -> float:
+    """Triangular fundamental diagram: speed(k). Density is veh/km/lane."""
+    if density_per_lane <= 1e-6:
+        return vf_kmh
+    if density_per_lane <= kc:
+        return vf_kmh
+    k = min(density_per_lane, kj)
+    q = max(w * (kj - k), 0.0)  # congested-branch flow, veh/hr/lane
+    return q / k if k > 0 else 0.0
+
+
+# ===========================================================================
+# 2. EMISSIONS  (simplified speed-based CO2 curve — MOVES/COPERT-style shape)
+# ===========================================================================
+# Real emission-rate curves are U-shaped: idling/stop-start wastes fuel,
+# and high aerodynamic drag wastes fuel again at high speed. The sweet
+# spot sits around 55-65 km/h. Coefficients below reproduce that shape
+# and land in the right order of magnitude for a typical passenger car
+# (roughly 120-260 gCO2/km) without needing a full vehicle-emissions model.
+def co2_g_per_km(speed_kmh: float) -> float:
+    v = max(speed_kmh, 2.0)
+    return max(1200.0 / v + 0.018 * v * v + 40.0, 60.0)
+
+
+def idling_co2_g_per_min() -> float:
+    """CO2 output of a stationary, idling engine (grams/minute)."""
+    return 14.0
+
+
+# ===========================================================================
+# 3. SIGNAL CONTROL
+# ===========================================================================
+def webster_delay_seconds(cycle_s: float, green_ratio: float, degree_of_sat: float) -> float:
+    """
+    Webster's (1958) uniform-delay formula — the standard textbook estimate
+    of average per-vehicle delay at a fixed-time signalised approach.
+
+        d = C * (1 - lambda)^2 / (2 * (1 - lambda * x))
+
+    C = cycle length (s), lambda = green ratio (g/C), x = degree of
+    saturation (flow/capacity), clamped below 1 to keep the formula stable
+    near/at oversaturation (a real intersection queues indefinitely beyond
+    that point, which our link-level BPR term already penalises).
+    """
+    lam = min(max(green_ratio, 0.05), 0.95)
+    x = min(max(degree_of_sat, 0.0), 0.97)
+    denom = 2.0 * (1.0 - lam * x)
+    if denom <= 1e-6:
+        denom = 1e-6
+    d = cycle_s * ((1.0 - lam) ** 2) / denom
+    return max(d, 0.0)
+
+
+@dataclass
+class SignalController:
+    """Base class: a 2-phase signal controlling a node's incoming edges.
+
+    phase_a / phase_b are lists of incoming EdgeKeys grouped by approach
+    direction (see `_group_phases`). `green_ratio_a` is the fraction of
+    the cycle phase A gets (phase B gets the remainder, minus lost time).
+    """
+    node: object
+    phase_a: List[EdgeKey]
+    phase_b: List[EdgeKey]
+    cycle_s: float = 90.0
+    green_ratio_a: float = 0.5
+    mode: str = "fixed"
+
+    def green_ratio_for(self, edge: EdgeKey) -> float:
+        if edge in self.phase_a:
+            return self.green_ratio_a
+        if edge in self.phase_b:
+            return 1.0 - self.green_ratio_a
+        return 0.5
+
+    def update(self, dt_min: float, queue_a: float, queue_b: float) -> None:
+        """Default (fixed-time) controller: never changes the split."""
+        return
+
+
+@dataclass
+class AdaptiveSignal(SignalController):
+    """
+    Rule-based adaptive controller: every decision interval, re-splits
+    green time proportionally to the relative queue pressure on each
+    phase — the simplest real-world "actuated signal" strategy, and the
+    baseline every adaptive-signal paper compares against.
+    """
+    min_green_ratio: float = 0.2
+    max_green_ratio: float = 0.8
+
+    def update(self, dt_min: float, queue_a: float, queue_b: float) -> None:
+        total = queue_a + queue_b
+        if total < 1e-6:
+            target = 0.5
+        else:
+            target = queue_a / total
+        target = min(max(target, self.min_green_ratio), self.max_green_ratio)
+        # smooth toward the target so the signal doesn't visibly "teleport"
+        self.green_ratio_a += (target - self.green_ratio_a) * min(1.0, dt_min / 2.0)
+
+
+@dataclass
+class QLearningSignal(SignalController):
+    """
+    Tabular Q-learning adaptive signal. State = (bucketed queue_a,
+    bucketed queue_b). Action = {favor_a, favor_b, balanced}, which sets
+    a target green ratio. Reward = -(queue_a + queue_b) after the action,
+    i.e. the agent learns to pick splits that minimise total queueing —
+    the same objective classic Q-learning traffic-signal papers use.
+
+    This is intentionally a small, fast, *online* learner (a handful of
+    states/actions) so it can run every tick inside a Flask background
+    thread with no training data or GPU — it starts naive and visibly
+    improves its splits over the course of a session.
+    """
+    alpha: float = 0.3
+    gamma: float = 0.7
+    epsilon: float = 0.15
+    n_buckets: int = 5
+    actions: Tuple[float, ...] = (0.3, 0.5, 0.7)
+    q_table: Dict[Tuple[int, int, float], float] = field(default_factory=dict)
+    _last_state: Optional[Tuple[int, int]] = None
+    _last_action: Optional[float] = None
+
+    def _bucket(self, q: float) -> int:
+        return min(int(q // 3), self.n_buckets - 1)
+
+    def _q(self, state, action) -> float:
+        return self.q_table.get((state[0], state[1], action), 0.0)
+
+    def update(self, dt_min: float, queue_a: float, queue_b: float) -> None:
+        state = (self._bucket(queue_a), self._bucket(queue_b))
+        reward = -(queue_a + queue_b)
+
+        # learn from the previous step's transition (state, action) -> state
+        if self._last_state is not None:
+            best_next = max(self._q(state, a) for a in self.actions)
+            old = self._q(self._last_state, self._last_action)
+            td_target = reward + self.gamma * best_next
+            new_q = old + self.alpha * (td_target - old)
+            self.q_table[(self._last_state[0], self._last_state[1], self._last_action)] = new_q
+
+        # epsilon-greedy action selection
+        if random.random() < self.epsilon:
+            action = random.choice(self.actions)
+        else:
+            action = max(self.actions, key=lambda a: self._q(state, a))
+
+        self.green_ratio_a += (action - self.green_ratio_a) * min(1.0, dt_min / 1.5)
+        self._last_state = state
+        self._last_action = action
+
+
+def _bearing_deg(G: nx.MultiDiGraph, u, v) -> float:
+    """Approximate compass bearing of edge u->v from node lon/lat."""
+    ux, uy = G.nodes[u].get("x", 0.0), G.nodes[u].get("y", 0.0)
+    vx, vy = G.nodes[v].get("x", 0.0), G.nodes[v].get("y", 0.0)
+    dx, dy = (vx - ux), (vy - uy)
+    return math.degrees(math.atan2(dx, dy)) % 180.0
+
+
+def build_signals(G: nx.MultiDiGraph, cycle_s: float = 90.0,
+                   mode: str = "adaptive") -> Dict[object, SignalController]:
+    """
+    Create one signal controller per intersection with >= 3 incoming
+    approaches. Incoming edges are split into two phase groups by
+    real bearing (roughly N-S vs E-W traffic) when node coordinates are
+    available, which is exactly how a real 2-phase signal is designed.
+    """
+    signals: Dict[object, SignalController] = {}
+    cls = {"fixed": SignalController, "adaptive": AdaptiveSignal, "qlearning": QLearningSignal}.get(
+        mode, AdaptiveSignal
+    )
+
+    for node in G.nodes:
+        incoming = [(u, node, k) for u, _, k in G.in_edges(node, keys=True)]
+        if len(incoming) < 3:
+            continue
+        phase_a, phase_b = [], []
+        for (u, v, k) in incoming:
+            bearing = _bearing_deg(G, u, v)
+            (phase_a if bearing < 90.0 else phase_b).append((u, v, k))
+        if not phase_a or not phase_b:
+            # degenerate geometry (all edges same bearing) — split evenly by index
+            phase_a, phase_b = incoming[0::2], incoming[1::2]
+        signals[node] = cls(node=node, phase_a=phase_a, phase_b=phase_b, cycle_s=cycle_s, mode=mode)
+    return signals
+
+
+# ===========================================================================
+# 4. INCIDENTS
+# ===========================================================================
+@dataclass
+class Incident:
+    edge: EdgeKey
+    kind: str                  # "stalled_vehicle" | "pothole" | "illegal_parking" | "closure" | "manual_jam"
+    capacity_factor: float     # multiplies the edge's usable capacity, 0 = fully blocked
+    expires_at_min: float
+    predicted_clear_min: float
+
+
+# ===========================================================================
+# 5. DEMAND GENERATION  (diurnal Poisson process)
+# ===========================================================================
+def demand_multiplier(minute_of_day: float) -> float:
+    """Two-peak (AM/PM commute) demand curve, 0..~1.6, mirrors real urban counts."""
+    def bump(center, width, height):
+        return height * math.exp(-((minute_of_day - center) ** 2) / (2 * width * width))
+    baseline = 0.12
+    morning = bump(8 * 60, 65, 1.0)
+    evening = bump(18 * 60, 80, 1.15)
+    midday = bump(13 * 60, 130, 0.30)
+    return baseline + morning + evening + midday
+
+
+def _poisson_sample(lam: float) -> int:
+    """Knuth's algorithm — pure-stdlib Poisson sampler (no numpy dependency)."""
+    if lam <= 0:
+        return 0
+    if lam > 30:  # normal approximation is fine and much faster for big lambdas
+        return max(0, int(round(random.gauss(lam, math.sqrt(lam)))))
+    l = math.exp(-lam)
+    k, p = 0, 1.0
+    while True:
+        k += 1
+        p *= random.random()
+        if p <= l:
+            return k - 1
+
+
+# ===========================================================================
+# 6. VEHICLES
+# ===========================================================================
+@dataclass
+class Vehicle:
+    vid: int
+    route: List[EdgeKey]
+    edge_idx: int = 0
+    enter_time_min: float = 0.0
+    exit_time_min: float = 0.0
+    spawn_time_min: float = 0.0
+    is_emergency: bool = False
+
+    @property
+    def current_edge(self) -> EdgeKey:
+        return self.route[self.edge_idx]
+
+
+# ===========================================================================
+# 7. THE SIMULATION ENGINE
+# ===========================================================================
+class TrafficSimulation:
+    """
+    Live, ticking macroscopic traffic simulation over a networkx graph
+    already built & enriched by virtual_world.py.
+
+    Call `.start()` to run it in a background thread inside the Flask
+    process, or call `.tick()` yourself in a synchronous loop/test.
+    """
+
+    def __init__(self, G: nx.MultiDiGraph, recompute_weight_fn,
+                 tick_seconds: float = 2.0, sim_minutes_per_tick: float = 1.0,
+                 signal_mode: str = "adaptive", max_vehicles: int = 3500,
+                 base_spawn_rate_per_min: float = None, seed: Optional[int] = None):
+        self.G = G
+        self._recompute_weight = recompute_weight_fn
+        self.tick_seconds = tick_seconds
+        self.dt_min = sim_minutes_per_tick
+        self.max_vehicles = max_vehicles
+        self.rng = random.Random(seed)
+
+        n_nodes = max(G.number_of_nodes(), 1)
+        # Scale demand with network size so small synthetic grids and big
+        # real-city extracts both produce sensible, non-degenerate load.
+        # Calibrated so that, at rush-hour peak (demand_multiplier ~= 1.6),
+        # popular corridors sit in the 0.5-1.0 congestion_score range
+        # rather than staying near-empty — useful defaults for a live demo;
+        # tune with `demand_scale` (also exposed over the API, wired to the
+        # dashboard's "traffic density" slider) for a real deployment.
+        self.base_spawn_rate_per_min = (
+            base_spawn_rate_per_min if base_spawn_rate_per_min is not None
+            else max(1.0, n_nodes * 15.0)
+        )
+        self.demand_scale = 1.0  # 0..~3, live-tunable multiplier on top of the above
+
+        self.sim_clock_min = 8.0 * 60.0  # simulation "starts" at 08:00, peak of AM rush
+        self.vehicles: Dict[int, Vehicle] = {}
+        self._next_vid = 0
+        self.edge_occupants: Dict[EdgeKey, set] = {e: set() for e in G.edges(keys=True)}
+        # throughput counter (vehicles that *entered* each edge since the
+        # last state update) — this, not instantaneous occupancy, is what
+        # drives congestion_score. Occupancy snapshots break down whenever
+        # a tick's sim-minutes exceed a short link's free-flow travel time
+        # (the vehicle has already exited by the time we sample it); flow
+        # is the standard, tick-size-independent traffic-engineering
+        # measure (it's literally what capacity_veh_per_hr is denominated
+        # in, and what the BPR formula was designed around).
+        self.edge_entries_since_update: Dict[EdgeKey, int] = {e: 0 for e in G.edges(keys=True)}
+        self.incidents: List[Incident] = []
+        self.signals: Dict[object, SignalController] = build_signals(G, mode=signal_mode)
+        self.signal_mode = signal_mode
+
+        self.history: Dict[EdgeKey, deque] = {
+            e: deque(maxlen=180) for e in G.edges(keys=True)
+        }  # (sim_time_min, congestion_score) — 180 samples ≈ 3h at 1 sample/min
+
+        self.trips_completed = 0
+        self.total_travel_time_min = 0.0
+        self.total_co2_g = 0.0
+
+        self._green_wave: Dict[object, Tuple[EdgeKey, float]] = {}  # node -> (favored edge, expires_at_min)
+
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+
+        self._init_edge_fd_cache()
+
+    # -- fundamental-diagram parameters are static per edge, cache them ----
+    def _init_edge_fd_cache(self):
+        self._fd_cache: Dict[EdgeKey, Tuple[float, float, float]] = {}
+        for u, v, k, data in self.G.edges(keys=True, data=True):
+            vf = data.get("free_flow_speed_kmh", 30.0)
+            self._fd_cache[(u, v, k)] = fd_params(vf)
+
+    # -----------------------------------------------------------------
+    # Thread control
+    # -----------------------------------------------------------------
+    def start(self):
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        with self._lock:
+            self._running = False
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def _loop(self):
+        while self._running:
+            self.tick()
+            time.sleep(self.tick_seconds)
+
+    # -----------------------------------------------------------------
+    # One simulation step
+    # -----------------------------------------------------------------
+    def tick(self):
+        with self._lock:
+            self.sim_clock_min += self.dt_min
+            self._expire_incidents()
+            self._spawn_vehicles()
+            self._advance_vehicles()
+            self._update_signals()
+            self._update_edge_states()
+
+    # ---- demand & routing -------------------------------------------------
+    def _spawn_vehicles(self):
+        if len(self.vehicles) >= self.max_vehicles:
+            return
+        rate = (self.base_spawn_rate_per_min * self.demand_scale
+                * demand_multiplier(self.sim_clock_min % 1440.0))
+        n_new = _poisson_sample(rate * self.dt_min)
+        nodes = list(self.G.nodes)
+        if len(nodes) < 2:
+            return
+        for _ in range(n_new):
+            if len(self.vehicles) >= self.max_vehicles:
+                break
+            origin = self.rng.choice(nodes)
+            dest = self.rng.choice(nodes)
+            if origin == dest:
+                continue
+            route = self._route_edges(origin, dest)
+            if not route:
+                continue
+            self._push_vehicle(route, is_emergency=False)
+
+    def _route_edges(self, source, target) -> Optional[List[EdgeKey]]:
+        try:
+            path = nx.dijkstra_path(self.G, source, target, weight="weight")
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            return None
+        edges = []
+        for u, v in zip(path[:-1], path[1:]):
+            parallel = self.G[u][v]
+            k = min(parallel, key=lambda kk: parallel[kk].get("weight", 1e9))
+            edges.append((u, v, k))
+        return edges or None
+
+    def _push_vehicle(self, route: List[EdgeKey], is_emergency: bool) -> Vehicle:
+        vid = self._next_vid
+        self._next_vid += 1
+        veh = Vehicle(vid=vid, route=route, spawn_time_min=self.sim_clock_min,
+                      is_emergency=is_emergency)
+        self._enter_edge(veh, route[0], self.sim_clock_min)
+        self.vehicles[vid] = veh
+        return veh
+
+    def _enter_edge(self, veh: Vehicle, edge: EdgeKey, now: float):
+        u, v, k = edge
+        data = self.G[u][v][k]
+        travel_time_min = max(data.get("weight", data.get("free_flow_time_min", 0.5)), 0.05)
+        veh.enter_time_min = now
+        veh.exit_time_min = now + travel_time_min
+        self.edge_occupants.setdefault(edge, set()).add(veh.vid)
+        self.edge_entries_since_update[edge] = self.edge_entries_since_update.get(edge, 0) + 1
+
+    # ---- vehicle progression ----------------------------------------------
+    def _advance_vehicles(self):
+        now = self.sim_clock_min
+        done_ids = []
+        for vid, veh in self.vehicles.items():
+            guard = 0
+            while veh.exit_time_min <= now and guard < 25:
+                guard += 1
+                self.edge_occupants.get(veh.current_edge, set()).discard(vid)
+                veh.edge_idx += 1
+                if veh.edge_idx >= len(veh.route):
+                    self.trips_completed += 1
+                    self.total_travel_time_min += now - veh.spawn_time_min
+                    done_ids.append(vid)
+                    break
+                self._enter_edge(veh, veh.current_edge, veh.exit_time_min)
+        for vid in done_ids:
+            del self.vehicles[vid]
+
+    # ---- signals ------------------------------------------------------
+    def _queue_estimate(self, edges: List[EdgeKey]) -> float:
+        total = 0.0
+        for e in edges:
+            data = self.G.edges[e]
+            total += data.get("current_volume", 0) * data.get("congestion_score", 0.0)
+        return total
+
+    def _update_signals(self):
+        for node, sig in self.signals.items():
+            qa = self._queue_estimate(sig.phase_a)
+            qb = self._queue_estimate(sig.phase_b)
+            sig.update(self.dt_min, qa, qb)
+
+    # ---- incidents ------------------------------------------------------
+    def _expire_incidents(self):
+        self.incidents = [i for i in self.incidents if i.expires_at_min > self.sim_clock_min]
+
+    def trigger_incident(self, edge: Optional[EdgeKey] = None, kind: str = "stalled_vehicle",
+                          duration_min: float = 20.0, capacity_factor: float = 0.4) -> Incident:
+        with self._lock:
+            if edge is None:
+                edge = self.rng.choice(list(self.G.edges(keys=True)))
+            inc = Incident(edge=edge, kind=kind, capacity_factor=capacity_factor,
+                            expires_at_min=self.sim_clock_min + duration_min,
+                            predicted_clear_min=duration_min)
+            self.incidents.append(inc)
+            return inc
+
+    def set_demand_scale(self, scale: float):
+        """Live control for overall trip-generation intensity — this is what
+        the dashboard's 'Traffic density' slider should drive."""
+        with self._lock:
+            self.demand_scale = max(0.0, min(scale, 4.0))
+
+    def set_road_closed(self, edge: EdgeKey, closed: bool):
+        with self._lock:
+            self.incidents = [i for i in self.incidents if i.edge != edge]
+            if closed:
+                self.incidents.append(Incident(
+                    edge=edge, kind="closure", capacity_factor=0.0,
+                    expires_at_min=self.sim_clock_min + 10_000.0, predicted_clear_min=0.0,
+                ))
+
+    def _incident_factor(self, edge: EdgeKey) -> float:
+        factor = 1.0
+        for inc in self.incidents:
+            if inc.edge == edge:
+                factor = min(factor, inc.capacity_factor)
+        return factor
+
+    # ---- emergency green wave -----------------------------------------
+    def emergency_green_wave(self, path_nodes: List[object], vehicle_speed_kmh: float = 60.0,
+                              hold_s: float = 25.0):
+        """
+        Schedule green-wave priority along a corridor: for every node the
+        emergency vehicle will pass, compute its ETA from cumulative edge
+        lengths / vehicle_speed_kmh and hold that node's approach green
+        around the ETA — the standard transit-signal-priority technique.
+        """
+        with self._lock:
+            cum_km = 0.0
+            now = self.sim_clock_min
+            for i in range(len(path_nodes) - 1):
+                u, v = path_nodes[i], path_nodes[i + 1]
+                if v not in self.G[u]:
+                    continue
+                k = min(self.G[u][v], key=lambda kk: self.G[u][v][kk].get("length", 1e9))
+                length_km = self.G[u][v][k].get("length", 50.0) / 1000.0
+                cum_km += length_km
+                eta_min = now + (cum_km / max(vehicle_speed_kmh, 5.0)) * 60.0
+                if v in self.signals:
+                    sig = self.signals[v]
+                    edge = (u, v, k)
+                    favor = 0.95 if edge in sig.phase_a else 0.05
+                    sig.green_ratio_a = favor if edge in sig.phase_a else (1.0 - favor)
+                    self._green_wave[v] = (edge, eta_min + hold_s / 60.0)
+            veh = self._push_vehicle(
+                self._route_edges(path_nodes[0], path_nodes[-1]) or [], is_emergency=True
+            ) if len(path_nodes) >= 2 else None
+            return veh
+
+    # ---- state -> graph -------------------------------------------------
+    def _update_edge_states(self):
+        now = self.sim_clock_min
+        total_co2_tick = 0.0
+        dt_hours = max(self.dt_min, 1e-6) / 60.0
+
+        for edge in self.G.edges(keys=True):
+            u, v, k = edge
+            data = self.G[u][v][k]
+            occupants = self.edge_occupants.get(edge, set())
+            volume = len(occupants)  # instantaneous count, kept for the map/UI
+            lanes = max(data.get("lanes", 1), 1)
+            length_km = max(data.get("length", 50.0) / 1000.0, 0.01)
+            base_capacity = max(data.get("capacity_veh_per_hr", 1800.0), 1e-3)
+
+            incident_factor = max(self._incident_factor(edge), 1e-3)
+            effective_capacity = base_capacity * incident_factor
+
+            # Flow (throughput) is the tick-size-independent congestion
+            # signal: how many vehicles actually used this link this tick,
+            # expressed as an hourly rate, compared against how many the
+            # link (and any incident on it) can actually carry.
+            entries = self.edge_entries_since_update.get(edge, 0)
+            flow_veh_per_hr = entries / dt_hours
+            vc_ratio = flow_veh_per_hr / effective_capacity
+            congestion_score = min(vc_ratio, 1.4)  # allow mild oversaturation signal
+            self.edge_entries_since_update[edge] = 0
+
+            # Density/speed still come from the triangular fundamental
+            # diagram (driven by the flow we just measured) — this is what
+            # actually feeds the CO2 estimate and the "current speed" the
+            # digital twin displays, independent of tick granularity.
+            kc, kj, w = self._fd_cache.get(edge, fd_params(data.get("free_flow_speed_kmh", 30.0)))
+            equivalent_flow_per_lane = flow_veh_per_hr / lanes
+            if equivalent_flow_per_lane <= kc * data.get("free_flow_speed_kmh", 30.0):
+                speed_kmh = data.get("free_flow_speed_kmh", 30.0)
+            else:
+                # congested branch: solve q = w*(kj-k) => k, then v = q/k
+                k_est = max(kj - equivalent_flow_per_lane / max(w, 1e-3), kc)
+                speed_kmh = fd_speed(k_est, data.get("free_flow_speed_kmh", 30.0), kc, kj, w)
+            speed_kmh *= max(incident_factor, 0.02)
+
+            # Not clamped to 1.0: values up to 1.4 represent real
+            # oversaturation and are meant to feed extra BPR penalty into
+            # recompute_weight below. The frontend's colour scale already
+            # treats anything >= 0.7 as "red", so this is visually fine —
+            # it just also lets true gridlock cost more travel time than
+            # merely-at-capacity traffic, which flat-out clamping would hide.
+            data["current_volume"] = volume
+            data["flow_veh_per_hr"] = round(flow_veh_per_hr, 1)
+            data["current_speed_kmh"] = round(speed_kmh, 1)
+            data["congestion_score"] = round(congestion_score, 3)
+            data["queue_estimate"] = round(volume * min(congestion_score, 1.0), 1)
+
+            # signal delay added on top of the BPR link travel time
+            self._recompute_weight(data)
+            sig = self.signals.get(v)
+            if sig is not None:
+                green_ratio = sig.green_ratio_for(edge)
+                x = min(congestion_score * 1.2, 0.97)
+                delay_s = webster_delay_seconds(sig.cycle_s, green_ratio, x)
+                data["signal_delay_min"] = round(delay_s / 60.0, 3)
+                data["weight"] = round(data["weight"] + data["signal_delay_min"], 4)
+            else:
+                data["signal_delay_min"] = 0.0
+
+            is_closed = any(i.edge == edge and i.kind == "closure" for i in self.incidents)
+            if is_closed:
+                # A closure isn't "4x slower" — it's unroutable. Push the
+                # weight far above anything Dijkstra would ever prefer
+                # instead of relying on the BPR curve to express "blocked".
+                data["weight"] = 1_000_000.0
+                data["congestion_score"] = 1.0
+                data["current_speed_kmh"] = 0.0
+                data["incident"] = True
+            elif incident_factor < 1.0:
+                data["weight"] = round(data["weight"] * (1.0 + 3.0 * (1.0 - incident_factor)), 4)
+                data["incident"] = True
+            else:
+                data["incident"] = False
+
+            emis_rate = co2_g_per_km(max(speed_kmh, 3.0))
+            co2_g = emis_rate * (volume * length_km) if speed_kmh > 3.0 else volume * idling_co2_g_per_min() * self.dt_min
+            total_co2_tick += co2_g
+
+            self.history[edge].append((now, data["congestion_score"]))
+
+        self.total_co2_g += total_co2_tick
+
+    # -----------------------------------------------------------------
+    # Forecasting — Holt's linear-trend exponential smoothing
+    # -----------------------------------------------------------------
+    def forecast(self, edge: EdgeKey, horizons_min=(15, 30, 60)) -> Dict[str, Dict]:
+        """
+        Lightweight statistical forecaster (Holt's double exponential
+        smoothing) over each edge's recent congestion history. This is an
+        intentionally cheap stand-in for the heavier XGBoost/STGCN model
+        described in the product plan — same interface/output shape, so it
+        can be swapped for a trained model later without touching the API.
+        """
+        hist = list(self.history.get(edge, []))
+        if len(hist) < 4:
+            current = self.G.edges[edge].get("congestion_score", 0.3)
+            return {f"{h}min": {"congestion_score": current, "confidence": "low"} for h in horizons_min}
+
+        alpha, beta = 0.5, 0.3
+        level = hist[0][1]
+        trend = hist[1][1] - hist[0][1]
+        for _, val in hist[1:]:
+            last_level = level
+            level = alpha * val + (1 - alpha) * (level + trend)
+            trend = beta * (level - last_level) + (1 - beta) * trend
+
+        values = [v for _, v in hist]
+        mean = sum(values) / len(values)
+        variance = sum((v - mean) ** 2 for v in values) / len(values)
+        confidence = "high" if variance < 0.01 else ("medium" if variance < 0.05 else "low")
+
+        out = {}
+        for h in horizons_min:
+            steps = h / max(self.dt_min, 0.01)
+            pred = level + trend * steps
+            out[f"{h}min"] = {"congestion_score": round(min(max(pred, 0.0), 1.0), 3),
+                               "confidence": confidence}
+        return out
+
+    # -----------------------------------------------------------------
+    # Public read-only snapshot for the API layer
+    # -----------------------------------------------------------------
+    def get_state(self) -> Dict:
+        with self._lock:
+            edges = self.G.edges(keys=True, data=True)
+            scores = [d.get("congestion_score", 0.0) for *_, d in edges]
+            avg_load = (sum(scores) / len(scores)) if scores else 0.0
+            return {
+                "running": self._running,
+                "sim_clock_min": round(self.sim_clock_min % 1440.0, 1),
+                "sim_day_hhmm": f"{int(self.sim_clock_min % 1440 // 60):02d}:{int(self.sim_clock_min % 60):02d}",
+                "signal_mode": self.signal_mode,
+                "active_vehicles": len(self.vehicles),
+                "trips_completed": self.trips_completed,
+                "avg_travel_time_min": round(
+                    self.total_travel_time_min / self.trips_completed, 2
+                ) if self.trips_completed else None,
+                "avg_network_load": round(avg_load, 3),
+                "active_incidents": [
+                    {"edge": list(map(str, i.edge)), "kind": i.kind,
+                     "capacity_factor": i.capacity_factor,
+                     "clears_in_min": round(i.expires_at_min - self.sim_clock_min, 1)}
+                    for i in self.incidents
+                ],
+                "total_co2_kg": round(self.total_co2_g / 1000.0, 2),
+                "signals": {
+                    str(node): {"green_ratio_a": round(sig.green_ratio_a, 2), "mode": sig.mode}
+                    for node, sig in self.signals.items()
+                },
+                "edges": {
+                    f"{u}-{v}-{k}": {
+                        "congestion_score": d.get("congestion_score"),
+                        "weight": d.get("weight"),
+                        "current_speed_kmh": d.get("current_speed_kmh"),
+                        "current_volume": d.get("current_volume"),
+                        "queue_estimate": d.get("queue_estimate"),
+                        "incident": d.get("incident", False),
+                        "signal_delay_min": d.get("signal_delay_min", 0.0),
+                    }
+                    for u, v, k, d in edges
+                },
+            }
+
+
+# ===========================================================================
+# 8. FRANK-WOLFE STATIC USER-EQUILIBRIUM ASSIGNMENT (what-if engine)
+# ===========================================================================
+def _bpr_time(free_flow_min: float, volume: float, capacity: float,
+              alpha: float = 0.15, beta: float = 4.0) -> float:
+    if capacity <= 0:
+        return free_flow_min * 50.0  # effectively closed
+    ratio = volume / capacity
+    return free_flow_min * (1.0 + alpha * (ratio ** beta))
+
+
+def _all_or_nothing(G: nx.MultiDiGraph, od_demand: Dict[Tuple, float],
+                     times: Dict[EdgeKey, float]) -> Dict[EdgeKey, float]:
+    """Assign every OD trip to its current shortest path (all-or-nothing)."""
+    H = nx.DiGraph()
+    for u, v, k in G.edges(keys=True):
+        t = times.get((u, v, k), 1e6)
+        if (u, v) not in H.edges or t < H[u][v]["weight"]:
+            H.add_edge(u, v, weight=t, key=k)
+
+    aux_flow: Dict[EdgeKey, float] = {e: 0.0 for e in G.edges(keys=True)}
+    for (o, d), demand in od_demand.items():
+        if demand <= 0 or o == d:
+            continue
+        try:
+            path = nx.dijkstra_path(H, o, d, weight="weight")
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            continue
+        for u, v in zip(path[:-1], path[1:]):
+            k = H[u][v]["key"]
+            aux_flow[(u, v, k)] = aux_flow.get((u, v, k), 0.0) + demand
+    return aux_flow
+
+
+def run_frank_wolfe(G: nx.MultiDiGraph, od_demand: Dict[Tuple, float],
+                     max_iter: int = 25, tol: float = 1e-3) -> Dict[EdgeKey, Dict]:
+    """
+    Classic Frank-Wolfe convex-combinations algorithm for static User
+    Equilibrium traffic assignment (LeBlanc, Morlok & Pierskalla, 1975 —
+    the standard method taught for this exact problem). Converges toward
+    the flow pattern where no driver can unilaterally improve their travel
+    time by switching routes (Wardrop's first principle).
+
+    Returns per-edge {volume, travel_time_min, free_flow_time_min,
+    capacity} at the converged (or best found) equilibrium.
+    """
+    edges = list(G.edges(keys=True))
+    free_flow = {e: G.edges[e].get("free_flow_time_min", 1.0) for e in edges}
+    capacity = {e: max(G.edges[e].get("capacity_veh_per_hr", 1800.0), 1e-3) for e in edges}
+
+    volume: Dict[EdgeKey, float] = {e: 0.0 for e in edges}
+    times = dict(free_flow)
+    volume = _all_or_nothing(G, od_demand, times)
+
+    for n in range(1, max_iter + 1):
+        times = {e: _bpr_time(free_flow[e], volume[e], capacity[e]) for e in edges}
+        aux = _all_or_nothing(G, od_demand, times)
+        step = 2.0 / (n + 2.0)  # method-of-successive-averages step size (Frank-Wolfe standard)
+
+        new_volume = {e: volume[e] + step * (aux.get(e, 0.0) - volume[e]) for e in edges}
+        delta = sum(abs(new_volume[e] - volume[e]) for e in edges) / max(len(edges), 1)
+        volume = new_volume
+        if delta < tol:
+            break
+
+    times = {e: _bpr_time(free_flow[e], volume[e], capacity[e]) for e in edges}
+    return {
+        e: {
+            "volume_veh_per_hr": round(volume[e], 1),
+            "travel_time_min": round(times[e], 3),
+            "free_flow_time_min": round(free_flow[e], 3),
+            "capacity_veh_per_hr": round(capacity[e], 1),
+        }
+        for e in edges
+    }
+
+
+def estimate_od_demand(G: nx.MultiDiGraph, n_pairs: int = 60, total_trips_per_hr: float = 4000.0,
+                        seed: Optional[int] = None) -> Dict[Tuple, float]:
+    """
+    Build a plausible OD demand matrix when the caller doesn't supply real
+    survey/telemetry data: sample random (origin, destination) node pairs
+    weighted toward higher-degree nodes (real intersections generate more
+    trips than dead-ends), and split total network demand across them.
+    """
+    rng = random.Random(seed)
+    nodes = list(G.nodes)
+    if len(nodes) < 2:
+        return {}
+    weights = [max(G.degree(n), 1) for n in nodes]
+    pairs = set()
+    attempts = 0
+    while len(pairs) < min(n_pairs, len(nodes) * (len(nodes) - 1)) and attempts < n_pairs * 20:
+        attempts += 1
+        o = rng.choices(nodes, weights=weights, k=1)[0]
+        d = rng.choices(nodes, weights=weights, k=1)[0]
+        if o != d:
+            pairs.add((o, d))
+    if not pairs:
+        return {}
+    per_pair = total_trips_per_hr / len(pairs)
+    return {p: per_pair for p in pairs}
+
+
+def compare_scenarios(G: nx.MultiDiGraph, od_demand: Optional[Dict[Tuple, float]] = None,
+                       close_edges: Optional[List[EdgeKey]] = None,
+                       capacity_multipliers: Optional[Dict[EdgeKey, float]] = None) -> Dict:
+    """
+    The "Counterfactual Impact Analysis" the plan asks for: run Frank-Wolfe
+    once on the network as-is, once on a modified copy (closures / capacity
+    changes applied), and report the before/after deltas so a planner can
+    evaluate a change *before* enforcing it in the real world.
+    """
+    if od_demand is None:
+        od_demand = estimate_od_demand(G)
+
+    baseline = run_frank_wolfe(G, od_demand)
+
+    G2 = G.copy()
+    for e in (close_edges or []):
+        if e in G2.edges:
+            G2.edges[e]["capacity_veh_per_hr"] = 1e-3
+            G2.edges[e]["free_flow_time_min"] *= 1000.0
+    for e, mult in (capacity_multipliers or {}).items():
+        if e in G2.edges:
+            G2.edges[e]["capacity_veh_per_hr"] = max(G2.edges[e].get("capacity_veh_per_hr", 1800.0) * mult, 1e-3)
+
+    scenario = run_frank_wolfe(G2, od_demand)
+
+    def total_veh_min(result):
+        return sum(r["volume_veh_per_hr"] * r["travel_time_min"] for r in result.values())
+
+    baseline_total = total_veh_min(baseline)
+    scenario_total = total_veh_min(scenario)
+
+    worst_edges = sorted(
+        scenario.keys(),
+        key=lambda e: scenario[e]["travel_time_min"] - baseline.get(e, scenario[e])["travel_time_min"],
+        reverse=True,
+    )[:10]
+
+    return {
+        "baseline_total_veh_min": round(baseline_total, 1),
+        "scenario_total_veh_min": round(scenario_total, 1),
+        "network_delay_change_pct": round(
+            100.0 * (scenario_total - baseline_total) / baseline_total, 2
+        ) if baseline_total > 0 else 0.0,
+        "most_affected_edges": [
+            {
+                "edge": [str(x) for x in e],
+                "baseline_time_min": baseline.get(e, {}).get("travel_time_min"),
+                "scenario_time_min": scenario[e]["travel_time_min"],
+                "baseline_volume": baseline.get(e, {}).get("volume_veh_per_hr"),
+                "scenario_volume": scenario[e]["volume_veh_per_hr"],
+            }
+            for e in worst_edges
+        ],
+    }

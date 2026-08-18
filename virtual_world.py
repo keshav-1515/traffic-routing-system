@@ -29,6 +29,8 @@ import sys
 import networkx as nx
 from flask import Flask, jsonify, render_template, request
 
+import traffic_engine
+
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
@@ -38,6 +40,11 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 ROAD_GRAPH = None
 USING_SYNTHETIC = False
+
+# The live traffic-flow AI engine (traffic_engine.py). It receives this
+# SAME graph object and mutates its edge attributes in place every tick,
+# so /api/graph and /api/route stay live with zero changes to those routes.
+SIM: "traffic_engine.TrafficSimulation" = None
 
 
 # ---------------------------------------------------------------------------
@@ -229,8 +236,9 @@ def build_synthetic_grid(rows=8, cols=8, spacing_m=120, origin_lat=12.9716, orig
     return G
 
 
-def init_graph(place=None, bbox=None, dist=1500):
-    global ROAD_GRAPH, USING_SYNTHETIC
+def init_graph(place=None, bbox=None, dist=1500, signal_mode="adaptive",
+                tick_seconds=2.0, sim_minutes_per_tick=1.0, autostart=True):
+    global ROAD_GRAPH, USING_SYNTHETIC, SIM
     try:
         if place:
             ROAD_GRAPH = build_graph_from_place(place, dist=dist)
@@ -253,6 +261,21 @@ def init_graph(place=None, bbox=None, dist=1500):
     n_edges = ROAD_GRAPH.number_of_edges()
     print(f"[graph] Ready: {n_nodes} nodes (intersections), {n_edges} directed edges "
           f"({'synthetic' if USING_SYNTHETIC else 'real OSM data'})")
+
+    # Hand the graph to the live simulation/AI engine. It mutates the same
+    # edge dicts in place (congestion_score, weight, current_speed_kmh, ...)
+    # so every existing route below keeps working unmodified.
+    SIM = traffic_engine.TrafficSimulation(
+        ROAD_GRAPH,
+        recompute_weight_fn=recompute_weight,
+        tick_seconds=tick_seconds,
+        sim_minutes_per_tick=sim_minutes_per_tick,
+        signal_mode=signal_mode,
+    )
+    if autostart:
+        SIM.start()
+        print(f"[sim] Live traffic simulation started "
+              f"(tick every {tick_seconds}s = {sim_minutes_per_tick} sim-min, signals: {signal_mode})")
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +348,7 @@ def graph_to_geojson(G):
             "properties": {
                 "u": str(u),
                 "v": str(v),
+                "k": str(k),
                 "highway": str(data.get("highway", "unclassified")),
                 "lanes": data.get("lanes"),
                 "length_m": round(data.get("length", 0), 1),
@@ -332,8 +356,13 @@ def graph_to_geojson(G):
                 "capacity_veh_per_hr": data.get("capacity_veh_per_hr"),
                 "free_flow_time_min": data.get("free_flow_time_min"),
                 "weight": data.get("weight"),
-                # stored on the graph now, not re-randomized per request
+                # stored on the graph now, kept live by traffic_engine.TrafficSimulation
                 "congestion_score": data.get("congestion_score"),
+                "current_speed_kmh": data.get("current_speed_kmh"),
+                "current_volume": data.get("current_volume"),
+                "queue_estimate": data.get("queue_estimate"),
+                "signal_delay_min": data.get("signal_delay_min"),
+                "incident": data.get("incident", False),
             },
         })
 
@@ -390,6 +419,137 @@ def _graph_center():
 
 
 # ---------------------------------------------------------------------------
+# 5b. Simulation / AI-engine routes — all logic lives in traffic_engine.py,
+#     these routes just expose it.
+# ---------------------------------------------------------------------------
+def _find_edge(u, v, k=None):
+    u = int(u) if str(u).lstrip("-").isdigit() else u
+    v = int(v) if str(v).lstrip("-").isdigit() else v
+    if v not in ROAD_GRAPH[u]:
+        return None
+    if k is not None and k in ROAD_GRAPH[u][v]:
+        return (u, v, k)
+    # fall back to the first/only parallel edge
+    return (u, v, next(iter(ROAD_GRAPH[u][v])))
+
+
+@app.route("/api/simulate/state")
+def api_simulate_state():
+    """Live snapshot: sim clock, active vehicles, incidents, signals, CO2,
+    and per-edge congestion/speed/queue — everything the dashboard polls."""
+    return jsonify(SIM.get_state())
+
+
+@app.route("/api/simulate/start", methods=["POST"])
+def api_simulate_start():
+    SIM.start()
+    return jsonify({"running": SIM.running})
+
+
+@app.route("/api/simulate/stop", methods=["POST"])
+def api_simulate_stop():
+    SIM.stop()
+    return jsonify({"running": SIM.running})
+
+
+@app.route("/api/simulate/incident", methods=["POST"])
+def api_simulate_incident():
+    """
+    Body: {"u":.., "v":.., "k":.., "kind": "stalled_vehicle"|"pothole"|
+           "illegal_parking"|"manual_jam", "duration_min": 20,
+           "capacity_factor": 0.4}
+    Omit u/v to drop a random incident on the network.
+    """
+    body = request.get_json(silent=True) or {}
+    edge = None
+    if "u" in body and "v" in body:
+        edge = _find_edge(body["u"], body["v"], body.get("k"))
+        if edge is None:
+            return jsonify({"error": "no such edge"}), 404
+    inc = SIM.trigger_incident(
+        edge=edge,
+        kind=body.get("kind", "stalled_vehicle"),
+        duration_min=float(body.get("duration_min", 20.0)),
+        capacity_factor=float(body.get("capacity_factor", 0.4)),
+    )
+    return jsonify({"edge": [str(x) for x in inc.edge], "kind": inc.kind,
+                    "capacity_factor": inc.capacity_factor,
+                    "clears_in_min": inc.predicted_clear_min})
+
+
+@app.route("/api/simulate/demand", methods=["POST"])
+def api_simulate_demand():
+    """Body: {"scale": 0.0-4.0} — live trip-generation intensity multiplier,
+    driven by the dashboard's 'Traffic density' slider."""
+    body = request.get_json(silent=True) or {}
+    scale = float(body.get("scale", 1.0))
+    SIM.set_demand_scale(scale)
+    return jsonify({"demand_scale": SIM.demand_scale})
+
+
+@app.route("/api/simulate/closure", methods=["POST"])
+def api_simulate_closure():
+    """Body: {"u":.., "v":.., "k":.., "closed": true|false}"""
+    body = request.get_json(silent=True) or {}
+    edge = _find_edge(body.get("u"), body.get("v"), body.get("k"))
+    if edge is None:
+        return jsonify({"error": "no such edge"}), 404
+    SIM.set_road_closed(edge, bool(body.get("closed", True)))
+    return jsonify({"edge": [str(x) for x in edge], "closed": bool(body.get("closed", True))})
+
+
+@app.route("/api/simulate/emergency", methods=["POST"])
+def api_simulate_emergency():
+    """Body: {"path": [node_id, node_id, ...], "speed_kmh": 60}
+    Grants an uninterrupted green wave along the given node path (e.g. a
+    route already computed via /api/route) for an ambulance/fire/transit
+    vehicle, and spawns a tracked probe vehicle along it."""
+    body = request.get_json(silent=True) or {}
+    path = body.get("path", [])
+    path = [int(n) if str(n).lstrip("-").isdigit() else n for n in path]
+    if len(path) < 2:
+        return jsonify({"error": "path must have >= 2 nodes"}), 400
+    veh = SIM.emergency_green_wave(path, vehicle_speed_kmh=float(body.get("speed_kmh", 60.0)))
+    return jsonify({"scheduled_nodes": len(path), "vehicle_id": veh.vid if veh else None})
+
+
+@app.route("/api/forecast")
+def api_forecast():
+    """Example: /api/forecast?u=12&v=48&k=0&horizons=15,30,60"""
+    edge = _find_edge(request.args.get("u"), request.args.get("v"), request.args.get("k"))
+    if edge is None:
+        return jsonify({"error": "no such edge"}), 404
+    horizons = [int(h) for h in request.args.get("horizons", "15,30,60").split(",")]
+    return jsonify({"edge": [str(x) for x in edge], "forecast": SIM.forecast(edge, horizons)})
+
+
+@app.route("/api/whatif", methods=["POST"])
+def api_whatif():
+    """
+    Counterfactual "before vs after" analysis via Frank-Wolfe UE traffic
+    assignment (see traffic_engine.compare_scenarios). Body:
+        {"closures": [[u,v,k], [u,v,k]], "capacity_multipliers": {"u,v,k": 0.5}}
+    Both fields optional; an empty body still returns a baseline snapshot.
+    """
+    body = request.get_json(silent=True) or {}
+    closures = []
+    for triple in body.get("closures", []):
+        e = _find_edge(*triple) if len(triple) == 3 else _find_edge(triple[0], triple[1])
+        if e:
+            closures.append(e)
+    cap_mult = {}
+    for key, mult in (body.get("capacity_multipliers") or {}).items():
+        parts = key.split(",")
+        e = _find_edge(*parts) if len(parts) == 3 else _find_edge(parts[0], parts[1])
+        if e:
+            cap_mult[e] = float(mult)
+    result = traffic_engine.compare_scenarios(
+        ROAD_GRAPH, close_edges=closures, capacity_multipliers=cap_mult
+    )
+    return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
 # 6. CLI entrypoint
 # ---------------------------------------------------------------------------
 def parse_args():
@@ -403,10 +563,21 @@ def parse_args():
                          help="Radius in metres to pull around --place when it has no "
                               "Nominatim polygon boundary (default: 1500)")
     parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--signal-mode", choices=["fixed", "adaptive", "qlearning"],
+                         default="adaptive", help="Traffic-signal control strategy (default: adaptive)")
+    parser.add_argument("--tick-seconds", type=float, default=2.0,
+                         help="Real seconds between simulation ticks (default: 2.0)")
+    parser.add_argument("--sim-minutes-per-tick", type=float, default=1.0,
+                         help="Simulated minutes advanced per tick (default: 1.0)")
+    parser.add_argument("--no-autostart", action="store_true",
+                         help="Build the graph but don't start the live simulation loop")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    init_graph(place=args.place, bbox=args.bbox, dist=args.dist)
+    init_graph(place=args.place, bbox=args.bbox, dist=args.dist,
+               signal_mode=args.signal_mode, tick_seconds=args.tick_seconds,
+               sim_minutes_per_tick=args.sim_minutes_per_tick,
+               autostart=not args.no_autostart)
     app.run(host="0.0.0.0", port=args.port, debug=True, use_reloader=False)
