@@ -140,6 +140,11 @@
     background: var(--accent); color: white; font-weight: 600; font-size: 12.5px; cursor: pointer;
   }
   #route-find-btn:disabled { background: #2a3550; color: var(--text-faint); cursor: not-allowed; }
+  .primary-btn {
+    width: 100%; padding: 10px; border-radius: 8px; border: none;
+    background: var(--accent); color: white; font-weight: 600; font-size: 12.5px; cursor: pointer;
+  }
+  .primary-btn:disabled { background: #2a3550; color: var(--text-faint); cursor: not-allowed; }
   #route-clear-btn {
     width: 100%; margin-top: 6px; padding: 8px; border-radius: 8px; border: 1px solid var(--border);
     background: transparent; color: var(--text-dim); font-size: 12px; cursor: pointer;
@@ -229,6 +234,65 @@
   }
   .pick-marker-origin { background: #2ecc71; }
   .pick-marker-dest { background: #e74c3c; }
+
+  /* ---- Peak-hour toggle (topbar) ---- */
+  #peak-toggle {
+    pointer-events: auto; font-size: 11px; letter-spacing: 0.3px; text-transform: uppercase;
+    background: transparent; border: 1px solid var(--school); color: var(--school);
+    padding: 5px 11px; border-radius: 14px; cursor: pointer; transition: all .15s;
+    margin-left: auto;
+  }
+  #peak-toggle.active { background: var(--school); color: #241d00; border-color: var(--school); font-weight: 700; }
+
+  /* ---- Toast ---- */
+  #toast {
+    position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 1300;
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    font-size: 12px; padding: 9px 16px; border-radius: 20px; opacity: 0; transition: opacity .25s;
+    pointer-events: none; box-shadow: 0 4px 14px rgba(0,0,0,.4); max-width: 420px; text-align: center;
+  }
+  #toast.show { opacity: 1; }
+
+  /* ---- Camera tab ---- */
+  .selected-road-chip {
+    border: 1px dashed var(--border); border-radius: 8px; padding: 10px; margin: 8px 0 14px; font-size: 12px;
+  }
+  .selected-road-chip.empty { color: var(--text-faint); font-style: italic; text-align: center; }
+  input[type=file] {
+    width: 100%; font-size: 11.5px; color: var(--text-dim); margin-top: 6px;
+  }
+  #cam-status { margin-top: 8px; font-size: 11.5px; color: var(--text-dim); line-height: 1.5; }
+
+  /* ---- Edge popup: congestion slider + what-if ---- */
+  .pop .slider-row { margin-top: 10px; }
+  .pop .slider-row label { font-size: 10.5px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.3px; display: flex; justify-content: space-between; }
+  .pop input[type=range] { width: 100%; margin-top: 4px; accent-color: var(--accent); }
+  .pop .whatif-btn {
+    width: 100%; margin-top: 8px; padding: 7px 6px; border-radius: 7px; border: 1px dashed var(--accent);
+    background: transparent; color: var(--accent); font-size: 11.5px; cursor: pointer;
+  }
+  .pop .whatif-btn:hover { background: rgba(51,136,255,0.12); }
+
+  /* ---- Vehicles (demo) tab ---- */
+  .btn-row-2 { display: flex; gap: 6px; margin-top: 8px; }
+  .field-row { margin: 10px 0; }
+  .field-row label { display: block; font-size: 11px; color: var(--text-faint); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.4px; }
+  .field-row input[type=number] {
+    width: 100%; background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    padding: 7px 9px; border-radius: 7px; font-size: 12.5px;
+  }
+  button.side-btn {
+    flex: 1; padding: 9px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--panel-2); color: var(--text); font-size: 12px; cursor: pointer;
+  }
+  button.side-btn:hover { border-color: var(--accent); color: var(--accent); }
+  button.side-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.side-btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
+  button.side-btn.danger { border-color: var(--high); color: var(--high); }
+  .demo-veh-dot {
+    width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid rgba(255,255,255,0.85);
+    box-shadow: 0 0 3px rgba(0,0,0,.6);
+  }
 </style>
 </head>
 <body>
@@ -239,9 +303,11 @@
   <span class="live-dot" id="live-dot" title="Click to pause/resume the live simulation"></span>
   <span class="title">Urban Traffic Control</span>
   <span class="subtitle">— live digital twin</span>
+  <button id="peak-toggle" title="City-wide policy: penalize through-traffic on hospital/school/emergency zones even harder">Peak Hour: Off</button>
 </div>
 
 <button id="show-console" onclick="document.getElementById('console').classList.remove('collapsed')">Show panel</button>
+<div id="toast"></div>
 
 <div id="console">
   <div class="console-head">
@@ -254,6 +320,7 @@
     <div class="tab" data-tab="route" role="tab" aria-selected="false">Route</div>
     <div class="tab" data-tab="zones" role="tab" aria-selected="false">Zones</div>
     <div class="tab" data-tab="camera" role="tab" aria-selected="false">Camera</div>
+    <div class="tab" data-tab="vehicles" role="tab" aria-selected="false">Demo</div>
   </div>
 
   <!-- ============ NETWORK TAB ============ -->
@@ -335,12 +402,48 @@
 
   <!-- ============ CAMERA TAB ============ -->
   <div class="panel" data-panel="camera">
-    <div class="section-label">Vision-based incident feed</div>
+    <div class="section-label">Traffic-camera analysis</div>
     <div class="empty-note">
-      This build focuses on the traffic-flow digital twin. CCTV/YOLOv8
-      incident tickets plug into the same live-override mechanism the
-      road popups use (via the API's jam/boost/zone endpoints) and can be
-      wired to a real vision pipeline here.
+      Click a road on the map to select it, then upload a short clip. The
+      server runs OpenCV background-subtraction + contour counting to
+      estimate a live congestion score from actual vehicle motion, and
+      applies it to that road for ~10 simulated minutes — the same
+      "camera → congestion" IoT path a real CCTV/YOLOv8 pipeline would use.
+    </div>
+    <div class="section-label" style="margin-top:14px;">Selected road</div>
+    <div class="selected-road-chip empty" id="cam-selected-chip">No road selected — click one on the map</div>
+    <label style="font-size:11px;color:var(--text-faint);text-transform:uppercase;letter-spacing:0.4px;">Video clip</label>
+    <input type="file" id="cam-video-input" accept="video/*" disabled />
+    <button id="cam-analyze-btn" class="primary-btn" style="margin-top:10px;" disabled>Analyze &amp; apply</button>
+    <div id="cam-status"></div>
+  </div>
+
+  <!-- ============ DEMO VEHICLES TAB ============ -->
+  <div class="panel" data-panel="vehicles">
+    <div class="section-label">Demo vehicle batch</div>
+    <div class="empty-note">
+      Spawn a small tracked batch of vehicles and step them forward
+      manually — separate from the always-on background simulation above.
+      They still route against the live, congestion-aware graph, so they
+      react to any block/jam/boost/zone change exactly like real traffic.
+    </div>
+    <div class="field-row">
+      <label>Vehicles to spawn</label>
+      <input type="number" id="demo-spawn-count" value="15" min="1" max="200" />
+    </div>
+    <div class="btn-row-2">
+      <button class="side-btn primary" id="demo-btn-spawn">Spawn</button>
+      <button class="side-btn danger" id="demo-btn-reset">Reset</button>
+    </div>
+    <div class="btn-row-2">
+      <button class="side-btn" id="demo-btn-start">Start ticking</button>
+      <button class="side-btn" id="demo-btn-stop" disabled>Stop</button>
+    </div>
+    <div class="legend">
+      <div class="section-label">Status</div>
+      <div class="stat-row"><span class="k">Tick</span><span class="v" id="demo-tick">0</span></div>
+      <div class="stat-row"><span class="k">Active</span><span class="v" id="demo-active">0</span></div>
+      <div class="stat-row"><span class="k">Arrived</span><span class="v" id="demo-arrived">0</span></div>
     </div>
   </div>
 </div>
@@ -363,6 +466,31 @@
     return 'Congested';
   }
   const ZONE_COLORS = { hospital: '#ff6b9d', school: '#ffd166', emergency: '#ff3b3b' };
+
+  function toast(msg) {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.classList.add('show');
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => el.classList.remove('show'), 3200);
+  }
+
+  // ------------------------------------------------------------------
+  // Peak-hour policy toggle (city-wide zone routing penalty)
+  // ------------------------------------------------------------------
+  let peakHourActive = false;
+  const peakBtn = document.getElementById('peak-toggle');
+  function updatePeakUI() {
+    peakBtn.textContent = 'Peak Hour: ' + (peakHourActive ? 'On' : 'Off');
+    peakBtn.classList.toggle('active', peakHourActive);
+  }
+  peakBtn.addEventListener('click', () => {
+    postJSON('/api/scenario/peak_hour', { enabled: !peakHourActive }).then(r => {
+      peakHourActive = r.peak_hour_active;
+      updatePeakUI();
+      toast('Peak hour ' + (peakHourActive ? 'enabled — zone roads penalized harder' : 'disabled'));
+    });
+  });
 
   // ------------------------------------------------------------------
   // Console UI: tabs + collapse toggle
@@ -527,6 +655,15 @@
             <option value="emergency" ${live.zone_type === 'emergency' ? 'selected' : ''}>Emergency zone</option>
           </select>
         </div>
+
+        <div class="slider-row">
+          <label>Set congestion manually <span id="cong-slider-val-${u}-${v}-${k}">${score.toFixed(2)}</span></label>
+          <input type="range" min="0" max="1" step="0.05" value="${score}"
+                 oninput="document.getElementById('cong-slider-val-${u}-${v}-${k}').textContent = parseFloat(this.value).toFixed(2)"
+                 onchange="edgeSetCongestion('${u}','${v}','${k}', this.value)" />
+        </div>
+
+        <button class="whatif-btn" onclick="edgeWhatIf('${u}','${v}','${k}')">Run what-if: close this road (Frank-Wolfe)</button>
       </div>
     `;
   }
@@ -562,6 +699,115 @@
   window.edgeZoneChange = function (u, v, k, zoneType) {
     postJSON('/api/simulate/zone', { u, v, k, zone_type: zoneType || null }).then(() => refreshSimState());
   };
+
+  window.edgeSetCongestion = function (u, v, k, score) {
+    postJSON('/api/edge/congestion', { u, v, k, congestion_score: parseFloat(score) }).then(() => {
+      toast('Congestion manually set — overrides live measurement for a while');
+      refreshSimState();
+    });
+  };
+
+  window.edgeWhatIf = function (u, v, k) {
+    toast('Running Frank-Wolfe counterfactual…');
+    postJSON('/api/whatif', { closures: [[u, v, k]] }).then(data => {
+      if (data.error) { toast(data.error); return; }
+      const pct = data.network_delay_change_pct;
+      const dir = pct >= 0 ? 'increase' : 'decrease';
+      toast(`What-if: closing this road would ${dir} total city-wide travel time by ${Math.abs(pct)}%`);
+    });
+  };
+
+  // ------------------------------------------------------------------
+  // Camera tab: select a road on the map, upload a clip, apply analysis
+  // ------------------------------------------------------------------
+  let camSelectedEdge = null; // {u, v, k}
+  function setCamSelectedEdge(u, v, k, label) {
+    camSelectedEdge = { u, v, k };
+    const chip = document.getElementById('cam-selected-chip');
+    chip.classList.remove('empty');
+    chip.textContent = `${label || 'Road'} · ${u} → ${v}`;
+    document.getElementById('cam-video-input').disabled = false;
+    document.getElementById('cam-analyze-btn').disabled = false;
+  }
+  document.getElementById('cam-analyze-btn').addEventListener('click', () => {
+    const input = document.getElementById('cam-video-input');
+    if (!camSelectedEdge || !input.files.length) { toast('Select a road and a video first'); return; }
+    const fd = new FormData();
+    fd.append('video', input.files[0]);
+    fd.append('u', camSelectedEdge.u);
+    fd.append('v', camSelectedEdge.v);
+    fd.append('k', camSelectedEdge.k);
+    const statusEl = document.getElementById('cam-status');
+    statusEl.textContent = 'Analyzing footage…';
+    fetch('/api/traffic/video', { method: 'POST', body: fd })
+      .then(res => res.json())
+      .then(result => {
+        if (result.error) { statusEl.textContent = 'Error: ' + result.error; return; }
+        statusEl.textContent = `${result.method} — avg ${result.avg_moving_objects} moving objects/frame → congestion ${result.estimated_congestion_score} (applied for ~10 sim-min)`;
+        toast('Camera analysis applied to road');
+        refreshSimState();
+      })
+      .catch(() => { statusEl.textContent = 'Upload failed'; });
+  });
+
+  // ------------------------------------------------------------------
+  // Demo Vehicles tab: spawn/tick/reset a manually-controlled batch
+  // ------------------------------------------------------------------
+  const demoVehicleMarkers = new Map();
+  let demoTickTimer = null;
+
+  function refreshDemoSimState() {
+    fetch('/api/simulation/state').then(res => res.json()).then(state => {
+      document.getElementById('demo-tick').textContent = state.tick;
+      document.getElementById('demo-active').textContent = state.active;
+      document.getElementById('demo-arrived').textContent = state.arrived;
+      const seen = new Set();
+      state.vehicles.forEach(v => {
+        seen.add(v.id);
+        if (demoVehicleMarkers.has(v.id)) {
+          demoVehicleMarkers.get(v.id).setLatLng([v.lat, v.lng]);
+        } else {
+          const icon = L.divIcon({ className: '', html: `<div class="demo-veh-dot" style="background:${v.color}"></div>`, iconSize: [8, 8] });
+          demoVehicleMarkers.set(v.id, L.marker([v.lat, v.lng], { icon, interactive: false }).addTo(map));
+        }
+      });
+      for (const [id, marker] of demoVehicleMarkers) {
+        if (!seen.has(id)) { map.removeLayer(marker); demoVehicleMarkers.delete(id); }
+      }
+    });
+  }
+
+  document.getElementById('demo-btn-spawn').addEventListener('click', () => {
+    const count = parseInt(document.getElementById('demo-spawn-count').value, 10) || 10;
+    postJSON('/api/simulation/spawn', { count }).then(r => {
+      toast(`Spawned ${r.spawned} demo vehicles`);
+      refreshDemoSimState();
+    });
+  });
+
+  document.getElementById('demo-btn-start').addEventListener('click', () => {
+    if (demoTickTimer) return;
+    document.getElementById('demo-btn-start').disabled = true;
+    document.getElementById('demo-btn-stop').disabled = false;
+    demoTickTimer = setInterval(() => {
+      postJSON('/api/simulation/tick', { dt_min: 0.5 }).then(refreshDemoSimState);
+    }, 1200);
+  });
+
+  document.getElementById('demo-btn-stop').addEventListener('click', () => {
+    clearInterval(demoTickTimer); demoTickTimer = null;
+    document.getElementById('demo-btn-start').disabled = false;
+    document.getElementById('demo-btn-stop').disabled = true;
+  });
+
+  document.getElementById('demo-btn-reset').addEventListener('click', () => {
+    postJSON('/api/simulation/reset', {}).then(() => {
+      for (const marker of demoVehicleMarkers.values()) map.removeLayer(marker);
+      demoVehicleMarkers.clear();
+      refreshDemoSimState();
+      toast('Demo vehicle batch reset');
+    });
+  });
 
   // ------------------------------------------------------------------
   // Node popup
@@ -738,6 +984,9 @@
         simRunning = data.running;
         liveDot.classList.toggle('paused', !simRunning);
 
+        peakHourActive = data.peak_hour_active;
+        updatePeakUI();
+
         document.getElementById('sim-clock').textContent = data.sim_day_hhmm;
         document.getElementById('sim-vehicles').textContent = data.active_vehicles;
         document.getElementById('sim-trips').textContent = data.trips_completed;
@@ -796,7 +1045,7 @@
             capacity_factor: 1.0, zone_type: p.zone_type, incident: p.incident, override_label: '',
           };
           layer.bindPopup(() => buildEdgePopupHTML(key), { maxWidth: 280 });
-          layer.on('click', () => { openPopupEdgeKey = key; });
+          layer.on('click', () => { openPopupEdgeKey = key; setCamSelectedEdge(p.u, p.v, p.k, p.highway); });
           layer.on('popupopen', () => { openPopupEdgeKey = key; });
           layer.on('popupclose', () => { if (openPopupEdgeKey === key) openPopupEdgeKey = null; });
         }
@@ -823,6 +1072,7 @@
 
       refreshSimState();
       refreshVehicles();
+      refreshDemoSimState();
       setInterval(refreshSimState, 3000);
       setInterval(refreshVehicles, 1500);
     })

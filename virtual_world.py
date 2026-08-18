@@ -25,13 +25,39 @@ Run:
 import argparse
 import random
 import sys
+import tempfile
+import uuid
 
 import networkx as nx
 from flask import Flask, jsonify, render_template, request
 
 import traffic_engine
 
+try:
+    import cv2
+    import numpy as np
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+
 app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# Standalone "demo vehicle" simulation — a lightweight, admin-controlled,
+# spawn-and-step vehicle tracker that is INTENTIONALLY separate from the
+# always-on background TrafficSimulation (SIM) above. SIM continuously
+# generates city-wide traffic on its own clock via a Poisson demand process;
+# this one lets an operator spawn a small tracked batch of vehicles on
+# demand and step them forward one click/tick at a time — handy for a live
+# walkthrough demo ("watch these 15 cars find their route, now let's block
+# a road and watch them react") without touching the live simulation state.
+# It still routes against the SAME graph (ROAD_GRAPH) and therefore the SAME
+# live `weight` values SIM/the admin API keeps up to date, so its vehicles
+# react to every closure/jam/boost/zone/peak-hour change exactly like real
+# traffic would — it just isn't itself driving congestion_score/current_volume.
+# ---------------------------------------------------------------------------
+DEMO_VEHICLES = {}
+DEMO_SIM_TICK_COUNT = 0
 
 # ---------------------------------------------------------------------------
 # Global graph object — built once at startup, reused by every API call.
@@ -151,6 +177,186 @@ def randomize_congestion(G, seed=None):
     for _, _, _, data in G.edges(keys=True, data=True):
         data["congestion_score"] = round(random.uniform(0.05, 0.95), 2)
         recompute_weight(data)
+
+
+# ---------------------------------------------------------------------------
+# 1b. Demo vehicle simulation (spawn / tick / positions) — see the module
+#     docstring note above DEMO_VEHICLES for why this is separate from SIM.
+# ---------------------------------------------------------------------------
+def _random_routable_pair():
+    """Pick a random (source, target) node pair that actually has a path."""
+    nodes = list(ROAD_GRAPH.nodes)
+    for _ in range(50):
+        a, b = random.sample(nodes, 2)
+        if nx.has_path(ROAD_GRAPH, a, b):
+            return a, b
+    raise RuntimeError("Could not find a routable node pair in the graph")
+
+
+def demo_spawn_vehicles(count):
+    spawned = []
+    for _ in range(count):
+        try:
+            source, target = _random_routable_pair()
+            path = nx.dijkstra_path(ROAD_GRAPH, source, target, weight="weight")
+        except (RuntimeError, nx.NetworkXNoPath):
+            continue
+        vid = uuid.uuid4().hex[:8]
+        DEMO_VEHICLES[vid] = {
+            "id": vid, "source": source, "target": target, "path": path,
+            "edge_index": 0, "progress": 0.0, "status": "active",
+            "color": random.choice(["#3388ff", "#8e44ad", "#16a085", "#e67e22", "#2c3e50"]),
+        }
+        spawned.append(vid)
+    return spawned
+
+
+def _demo_reroute_vehicle(vehicle):
+    """Recompute the remaining route from the vehicle's current node using
+    the latest live weights, so demo vehicles react to closures/jams/zone
+    changes just like SIM's own vehicles do."""
+    path = vehicle["path"]
+    current_node = path[vehicle["edge_index"]]
+    try:
+        new_path = nx.dijkstra_path(ROAD_GRAPH, current_node, vehicle["target"], weight="weight")
+    except nx.NetworkXNoPath:
+        return
+    vehicle["path"] = new_path
+    vehicle["edge_index"] = 0
+
+
+def demo_tick_simulation(dt_min=0.5, reroute_every=4):
+    """Advance every active demo vehicle by dt_min simulated minutes along
+    its route, periodically re-routing against live weights."""
+    global DEMO_SIM_TICK_COUNT
+    DEMO_SIM_TICK_COUNT += 1
+
+    active_vehicles = [v for v in DEMO_VEHICLES.values() if v["status"] == "active"]
+    if DEMO_SIM_TICK_COUNT % reroute_every == 0:
+        for vehicle in active_vehicles:
+            _demo_reroute_vehicle(vehicle)
+
+    for vehicle in active_vehicles:
+        path = vehicle["path"]
+        if vehicle["edge_index"] >= len(path) - 1:
+            vehicle["status"] = "arrived"
+            continue
+        u, v = path[vehicle["edge_index"]], path[vehicle["edge_index"] + 1]
+        if not ROAD_GRAPH.has_edge(u, v):
+            vehicle["status"] = "arrived"  # graph changed under it; stop gracefully
+            continue
+        edge_data = min(ROAD_GRAPH[u][v].values(), key=lambda d: d.get("weight", 0.0))
+        edge_time_min = edge_data.get("free_flow_time_min", 0.1) or 0.1
+        vehicle["progress"] += dt_min / max(edge_time_min, 0.05)
+        if vehicle["progress"] >= 1.0:
+            vehicle["progress"] = 0.0
+            vehicle["edge_index"] += 1
+            if vehicle["edge_index"] >= len(path) - 1:
+                vehicle["status"] = "arrived"
+
+    return {
+        "tick": DEMO_SIM_TICK_COUNT,
+        "active": len(active_vehicles),
+        "arrived": sum(1 for v in DEMO_VEHICLES.values() if v["status"] == "arrived"),
+    }
+
+
+def demo_vehicle_positions():
+    """Interpolate every demo vehicle's current lat/lng along its current
+    edge, for the frontend's 'Demo Vehicles' tab markers."""
+    positions = []
+    for vehicle in DEMO_VEHICLES.values():
+        path = vehicle["path"]
+        if len(path) < 2:
+            continue
+        idx = min(vehicle["edge_index"], len(path) - 2)
+        u, v = path[idx], path[idx + 1]
+        if u not in ROAD_GRAPH.nodes or v not in ROAD_GRAPH.nodes:
+            continue
+        u_data, v_data = ROAD_GRAPH.nodes[u], ROAD_GRAPH.nodes[v]
+        t = vehicle["progress"] if vehicle["status"] == "active" else 1.0
+        lng = u_data["x"] + (v_data["x"] - u_data["x"]) * t
+        lat = u_data["y"] + (v_data["y"] - u_data["y"]) * t
+        positions.append({
+            "id": vehicle["id"], "lat": lat, "lng": lng,
+            "status": vehicle["status"], "color": vehicle["color"],
+        })
+    return positions
+
+
+# ---------------------------------------------------------------------------
+# 1c. Computer-vision traffic analysis (traffic-camera IoT input type)
+# ---------------------------------------------------------------------------
+def analyze_traffic_video(file_storage):
+    """
+    Estimate a congestion_score from an uploaded traffic-camera clip using
+    classic OpenCV background subtraction + contour counting — a real,
+    dependency-light motion-density heuristic (moving blobs above a size
+    threshold are treated as vehicles). This is intentionally simpler than a
+    full YOLOv8 + tracker pipeline (no model weights needed, runs anywhere
+    OpenCV runs); swapping in a proper detector/tracker later is a drop-in
+    replacement for this function's internals — everything downstream (the
+    edge update via SIM.set_manual_congestion) stays the same.
+    """
+    if not CV2_AVAILABLE:
+        raise RuntimeError(
+            "opencv-python-headless is not installed on the server. "
+            "Run: pip install opencv-python-headless numpy"
+        )
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        file_storage.save(tmp.name)
+        tmp_path = tmp.name
+
+    cap = cv2.VideoCapture(tmp_path)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open uploaded video — is it a valid video file?")
+
+    bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=200, varThreshold=32, detectShadows=False)
+    min_blob_area = 350  # pixels; filters out noise / small artifacts
+
+    frame_count = 0
+    moving_object_counts = []
+    max_frames = 300  # cap analysis time on long uploads
+
+    while frame_count < max_frames:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frame_count += 1
+
+        mask = bg_subtractor.apply(frame)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=1)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        vehicle_like = sum(1 for c in contours if cv2.contourArea(c) >= min_blob_area)
+
+        # Skip the first ~20 frames while the background model is still
+        # learning the empty road (those counts are unreliable).
+        if frame_count > 20:
+            moving_object_counts.append(vehicle_like)
+
+    cap.release()
+
+    if not moving_object_counts:
+        raise RuntimeError("Video too short to analyze (need at least ~1 second of footage)")
+
+    avg_moving_objects = sum(moving_object_counts) / len(moving_object_counts)
+    peak_moving_objects = max(moving_object_counts)
+
+    # Heuristic density -> congestion_score mapping: calibrated so ~10
+    # simultaneous moving vehicles in frame reads as "gridlock" (1.0).
+    density_reference = 10.0
+    congestion_score = round(min(1.0, avg_moving_objects / density_reference), 2)
+
+    return {
+        "frames_analyzed": frame_count,
+        "avg_moving_objects": round(avg_moving_objects, 2),
+        "peak_moving_objects": peak_moving_objects,
+        "estimated_congestion_score": congestion_score,
+        "method": "OpenCV MOG2 background subtraction + contour blob counting",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +842,144 @@ def api_whatif():
         ROAD_GRAPH, close_edges=closures, capacity_multipliers=cap_mult
     )
     return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# 5c. Admin control aliases + camera/scenario/peak-hour/demo-vehicle routes
+# ---------------------------------------------------------------------------
+@app.route("/api/edge/congestion", methods=["POST"])
+def api_edge_congestion():
+    """
+    Body: {"u":.., "v":.., "k":.., "congestion_score": 0.0-1.0}
+    Manual 'set congestion' admin control — forces this edge's congestion
+    score instead of letting it be measured from live flow, until cleared
+    (via /api/simulate/reset) or overwritten again. Same mechanism the
+    camera analyzer below uses, just operator-driven instead of vision-driven.
+    """
+    body = request.get_json(silent=True) or {}
+    edge = _find_edge(body.get("u"), body.get("v"), body.get("k"))
+    if edge is None:
+        return jsonify({"error": "no such edge"}), 404
+    try:
+        score = float(body["congestion_score"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "congestion_score (0-1) is required"}), 400
+    ov = SIM.set_manual_congestion(edge, score, label=body.get("label", "manual override"))
+    return jsonify({"edge": [str(x) for x in edge], "congestion_score": ov.manual_congestion_score})
+
+
+@app.route("/api/edge/block", methods=["POST"])
+def api_edge_block():
+    """Body: {"u":.., "v":.., "k":.., "blocked": true|false} — alias of /api/simulate/closure."""
+    body = request.get_json(silent=True) or {}
+    edge = _find_edge(body.get("u"), body.get("v"), body.get("k"))
+    if edge is None:
+        return jsonify({"error": "no such edge"}), 404
+    blocked = bool(body.get("blocked", True))
+    SIM.set_road_closed(edge, blocked)
+    return jsonify({"edge": [str(x) for x in edge], "blocked": blocked})
+
+
+@app.route("/api/edge/zone", methods=["POST"])
+def api_edge_zone_alias():
+    """Body: {"u":.., "v":.., "k":.., "zone_type": ...} — alias of /api/simulate/zone."""
+    return api_simulate_zone()
+
+
+@app.route("/api/scenario/peak_hour", methods=["POST"])
+def api_scenario_peak_hour():
+    """
+    Body: {"enabled": true}. City-wide policy toggle — while on, every
+    hospital/school/emergency zone road gets an extra routing penalty on
+    top of its normal zone weight (stacks with the existing always-on zone
+    penalty; see traffic_engine.PEAK_HOUR_ZONE_EXTRA_MULTIPLIER). Distinct
+    from /api/simulate/peak_surge, which is a temporary demand spike rather
+    than a routing policy.
+    """
+    body = request.get_json(silent=True) or {}
+    enabled = bool(body.get("enabled", not SIM.peak_hour_active))
+    return jsonify({"peak_hour_active": SIM.set_peak_hour(enabled)})
+
+
+@app.route("/api/scenario/reset", methods=["POST"])
+def api_scenario_reset():
+    """
+    Clears every closure, jam/boost capacity override, and manual/camera
+    congestion override city-wide, and turns peak hour off. Zone tags
+    (hospital/school/emergency) are kept. Also clears the demo-vehicle batch
+    (SIM's own live simulation and its auto-generated traffic are untouched
+    — use /api/simulate/stop if you want to pause that separately).
+    """
+    SIM.reset_scenario()
+    DEMO_VEHICLES.clear()
+    return jsonify({"status": "reset"})
+
+
+@app.route("/api/traffic/video", methods=["POST"])
+def api_traffic_video():
+    """
+    Multipart form: `video` file + `u`, `v`, optional `k` node ids.
+    Runs OpenCV motion-density analysis on the clip (see
+    analyze_traffic_video) and applies the resulting congestion_score to
+    that road segment via SIM.set_manual_congestion, same effect as a
+    manual congestion update but sourced from real footage instead of a
+    slider. The override auto-expires after 10 simulated minutes so a
+    stale camera snapshot doesn't dictate routing forever — re-upload to
+    refresh it.
+    """
+    if "video" not in request.files:
+        return jsonify({"error": "multipart field 'video' (a file) is required"}), 400
+    edge = _find_edge(request.form.get("u"), request.form.get("v"), request.form.get("k"))
+    if edge is None:
+        return jsonify({"error": "no such edge"}), 404
+    try:
+        analysis = analyze_traffic_video(request.files["video"])
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 400
+
+    SIM.set_manual_congestion(
+        edge, analysis["estimated_congestion_score"], duration_min=10.0,
+        label=f"camera: {analysis['avg_moving_objects']} obj/frame",
+    )
+    return jsonify({"edge": [str(x) for x in edge], **analysis})
+
+
+# --- Standalone demo-vehicle simulation (spawn/tick/reset on demand) -------
+
+@app.route("/api/simulation/spawn", methods=["POST"])
+def api_demo_sim_spawn():
+    """Body: {"count": 10} — spawns a tracked batch of demo vehicles."""
+    body = request.get_json(silent=True) or {}
+    count = max(1, min(200, int(body.get("count", 10))))
+    spawned = demo_spawn_vehicles(count)
+    return jsonify({"spawned": len(spawned), "vehicle_ids": spawned, "total_vehicles": len(DEMO_VEHICLES)})
+
+
+@app.route("/api/simulation/tick", methods=["POST"])
+def api_demo_sim_tick():
+    """Body: {"dt_min": 0.5} — advances demo vehicles one step along live-weighted routes."""
+    body = request.get_json(silent=True) or {}
+    dt_min = float(body.get("dt_min", 0.5))
+    return jsonify(demo_tick_simulation(dt_min=dt_min))
+
+
+@app.route("/api/simulation/state")
+def api_demo_sim_state():
+    return jsonify({
+        "tick": DEMO_SIM_TICK_COUNT,
+        "vehicles": demo_vehicle_positions(),
+        "total": len(DEMO_VEHICLES),
+        "active": sum(1 for v in DEMO_VEHICLES.values() if v["status"] == "active"),
+        "arrived": sum(1 for v in DEMO_VEHICLES.values() if v["status"] == "arrived"),
+    })
+
+
+@app.route("/api/simulation/reset", methods=["POST"])
+def api_demo_sim_reset():
+    DEMO_VEHICLES.clear()
+    global DEMO_SIM_TICK_COUNT
+    DEMO_SIM_TICK_COUNT = 0
+    return jsonify({"status": "demo simulation reset"})
 
 
 # ---------------------------------------------------------------------------

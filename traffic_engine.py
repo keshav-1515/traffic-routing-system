@@ -321,6 +321,20 @@ class EdgeOverride:
                              otherwise auto-clears itself on the tick
                              after this simulated time.
         label             -- free-text reason, shown in the UI/API.
+        manual_congestion_score
+                          -- None = congestion is measured live from actual
+                             flow (the normal path). When set (0..1), this
+                             value is used verbatim instead of the
+                             flow-derived measurement — this is what powers
+                             both a manual "set congestion" admin slider and
+                             the OpenCV traffic-camera analyzer (see
+                             `TrafficSimulation.set_manual_congestion` /
+                             virtual_world.py's `/api/traffic/video`), so an
+                             operator or a camera feed can assert "this is
+                             what's actually happening on this road" and
+                             have it flow straight into routing weight,
+                             overriding (but not replacing) the physics-based
+                             simulation underneath it.
     """
     edge: EdgeKey
     closed: bool = False
@@ -328,13 +342,20 @@ class EdgeOverride:
     zone_type: Optional[str] = None
     expires_at_min: Optional[float] = None
     label: str = ""
+    manual_congestion_score: Optional[float] = None
 
     def is_default(self) -> bool:
         return (not self.closed and abs(self.capacity_factor - 1.0) < 1e-6
-                and self.zone_type is None)
+                and self.zone_type is None and self.manual_congestion_score is None)
 
 
 ZONE_WEIGHT_MULTIPLIER = {"hospital": 1.7, "school": 1.7, "emergency": 8.0}
+
+# Extra multiplier stacked on top of ZONE_WEIGHT_MULTIPLIER while a
+# city-wide "peak hour" policy is active (see `TrafficSimulation.set_peak_hour`)
+# — during peak hour, routing should lean even harder on keeping through-
+# traffic out of hospital/school/emergency zones than it does normally.
+PEAK_HOUR_ZONE_EXTRA_MULTIPLIER = 3.0
 
 
 # ===========================================================================
@@ -437,6 +458,13 @@ class TrafficSimulation:
         self.edge_overrides: Dict[EdgeKey, EdgeOverride] = {}
         self.signals: Dict[object, SignalController] = build_signals(G, mode=signal_mode)
         self.signal_mode = signal_mode
+
+        # City-wide "peak hour" policy flag (distinct from `simulate_peak_surge`,
+        # which is a temporary demand spike): while active, every hospital/
+        # school/emergency-tagged road gets an EXTRA routing penalty on top
+        # of its normal zone weight, so through-traffic avoids those roads
+        # even harder during the window an admin flags as peak hour.
+        self.peak_hour_active: bool = False
 
         # peak-hour surge: an optional temporary network-wide (or
         # corridor-targeted) demand multiplier — see simulate_peak_surge()
@@ -651,6 +679,71 @@ class TrafficSimulation:
             self._apply_override_now(edge)
             return ov
 
+    def set_manual_congestion(self, edge: EdgeKey, congestion_score: float,
+                               duration_min: Optional[float] = None, label: str = "") -> EdgeOverride:
+        """
+        Force a specific congestion_score onto an edge instead of letting it
+        be measured from live flow — the mechanism behind both a manual
+        "set congestion" admin control and camera-derived congestion
+        (OpenCV motion-density analysis of an uploaded traffic clip; see
+        virtual_world.py's `/api/traffic/video`). `duration_min=None` means
+        the override persists until reset_edge()/clear is called; a camera
+        reading is typically applied with a short duration so a stale
+        snapshot doesn't dictate routing forever.
+        """
+        with self._lock:
+            ov = self._get_or_create_override(edge)
+            ov.manual_congestion_score = max(0.0, min(1.0, congestion_score))
+            ov.expires_at_min = (self.sim_clock_min + duration_min) if duration_min else ov.expires_at_min
+            ov.label = label or ov.label
+            self._apply_override_now(edge)
+            return ov
+
+    def clear_manual_congestion(self, edge: EdgeKey) -> None:
+        """Return an edge to live flow-measured congestion (keeps any other override, e.g. a zone tag)."""
+        with self._lock:
+            ov = self.edge_overrides.get(edge)
+            if ov is None:
+                return
+            ov.manual_congestion_score = None
+            if ov.is_default():
+                del self.edge_overrides[edge]
+            self._apply_override_now(edge)
+
+    def set_peak_hour(self, enabled: bool) -> bool:
+        """
+        City-wide policy toggle: while on, hospital/school/emergency zone
+        roads get PEAK_HOUR_ZONE_EXTRA_MULTIPLIER stacked on top of their
+        normal zone penalty, discouraging cut-through traffic during the
+        window an admin flags as peak hour. Immediately re-scores every
+        edge so the effect is visible without waiting for the next tick.
+        """
+        with self._lock:
+            self.peak_hour_active = bool(enabled)
+            for edge in list(self.G.edges(keys=True)):
+                self._apply_override_now(edge)
+            return self.peak_hour_active
+
+    def reset_scenario(self) -> None:
+        """
+        City-wide 'reset' action: clears every closure, capacity jam/boost,
+        and manual/camera congestion override, and turns peak hour off —
+        but KEEPS zone tags (hospital/school/emergency labeling is treated
+        as durable city data, not a transient scenario tweak). Live
+        flow-measured congestion simply resumes on the next tick.
+        """
+        with self._lock:
+            self.peak_hour_active = False
+            for edge, ov in list(self.edge_overrides.items()):
+                ov.closed = False
+                ov.capacity_factor = 1.0
+                ov.manual_congestion_score = None
+                ov.expires_at_min = None
+                if ov.is_default():
+                    del self.edge_overrides[edge]
+            for edge in list(self.G.edges(keys=True)):
+                self._apply_override_now(edge)
+
     def set_zone(self, edge: EdgeKey, zone_type: Optional[str]) -> Optional[EdgeOverride]:
         """Tag/untag a road as a hospital / school / emergency zone."""
         with self._lock:
@@ -754,6 +847,13 @@ class TrafficSimulation:
         effective_capacity = base_capacity * cap_factor
         flow = data.get("flow_veh_per_hr", 0.0)
         congestion_score = min(flow / effective_capacity, 1.4)
+
+        manual_score = override.manual_congestion_score if override else None
+        if manual_score is not None:
+            congestion_score = manual_score
+            data["current_speed_kmh"] = round(
+                data.get("free_flow_speed_kmh", 30.0) * max(1.0 - 0.65 * congestion_score, 0.08), 1
+            )
         data["congestion_score"] = round(congestion_score, 3)
 
         self._recompute_weight(data)
@@ -776,11 +876,14 @@ class TrafficSimulation:
         elif cap_factor > 1.0:
             data["weight"] = round(data["weight"] / cap_factor, 4)
         if zone_type and not is_closed:
-            data["weight"] = round(data["weight"] * ZONE_WEIGHT_MULTIPLIER.get(zone_type, 1.0), 4)
+            mult = ZONE_WEIGHT_MULTIPLIER.get(zone_type, 1.0)
+            if self.peak_hour_active:
+                mult *= PEAK_HOUR_ZONE_EXTRA_MULTIPLIER
+            data["weight"] = round(data["weight"] * mult, 4)
 
         data["zone_type"] = zone_type
         data["override_label"] = override.label if override else ""
-        data["incident"] = bool(override and (is_closed or cap_factor != 1.0))
+        data["incident"] = bool(override and (is_closed or cap_factor != 1.0 or manual_score is not None))
 
     def get_reroute_preview(self, edge: EdgeKey) -> Optional[Dict]:
         """
@@ -908,6 +1011,17 @@ class TrafficSimulation:
                 speed_kmh = fd_speed(k_est, data.get("free_flow_speed_kmh", 30.0), kc, kj, w)
             speed_kmh *= max(min(cap_factor, 1.0), 0.02)  # a boost (>1) doesn't raise physical speed limits
 
+            # A manual/camera-asserted congestion_score (admin slider or
+            # OpenCV traffic-camera analysis — see set_manual_congestion)
+            # overrides the flow-measured value for routing/display purposes,
+            # same as a live jam/boost override does for capacity. Physical
+            # flow is still measured underneath so it resumes seamlessly
+            # once the override expires/clears.
+            manual_score = override.manual_congestion_score if override else None
+            if manual_score is not None:
+                congestion_score = manual_score
+                speed_kmh = data.get("free_flow_speed_kmh", 30.0) * max(1.0 - 0.65 * congestion_score, 0.08)
+
             # Not clamped to 1.0: values up to 1.4 represent real
             # oversaturation and are meant to feed extra BPR penalty into
             # recompute_weight below. The frontend's colour scale already
@@ -949,11 +1063,14 @@ class TrafficSimulation:
                 data["weight"] = round(data["weight"] / cap_factor, 4)
 
             if zone_type and not is_closed:
-                data["weight"] = round(data["weight"] * ZONE_WEIGHT_MULTIPLIER.get(zone_type, 1.0), 4)
+                zone_mult = ZONE_WEIGHT_MULTIPLIER.get(zone_type, 1.0)
+                if self.peak_hour_active:
+                    zone_mult *= PEAK_HOUR_ZONE_EXTRA_MULTIPLIER
+                data["weight"] = round(data["weight"] * zone_mult, 4)
 
             data["zone_type"] = zone_type
             data["override_label"] = override.label if override else ""
-            data["incident"] = bool(override and (is_closed or cap_factor != 1.0))
+            data["incident"] = bool(override and (is_closed or cap_factor != 1.0 or manual_score is not None))
 
             emis_rate = co2_g_per_km(max(speed_kmh, 3.0))
             co2_g = emis_rate * (volume * length_km) if speed_kmh > 3.0 else volume * idling_co2_g_per_min() * self.dt_min
@@ -1020,9 +1137,11 @@ class TrafficSimulation:
                 ) if self.trips_completed else None,
                 "avg_network_load": round(avg_load, 3),
                 "peak_surge_active": self.sim_clock_min < self._surge_until_min,
+                "peak_hour_active": self.peak_hour_active,
                 "active_overrides": [
                     {"edge": list(map(str, e)), "closed": ov.closed,
                      "capacity_factor": ov.capacity_factor, "zone_type": ov.zone_type,
+                     "manual_congestion_score": ov.manual_congestion_score,
                      "label": ov.label,
                      "clears_in_min": (round(ov.expires_at_min - self.sim_clock_min, 1)
                                        if ov.expires_at_min is not None else None)}
