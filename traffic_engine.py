@@ -295,12 +295,46 @@ def build_signals(G: nx.MultiDiGraph, cycle_s: float = 90.0,
 # 4. INCIDENTS
 # ===========================================================================
 @dataclass
-class Incident:
+class EdgeOverride:
+    """
+    A single, unified per-edge manual/automatic control state. Replaces
+    "incidents" as a list with one authoritative override per edge, which
+    is what a real ops dashboard wants: click a road, see exactly what's
+    currently being done to it, change it, done.
+
+        closed           -- fully blocked (used by the "Block road" action
+                             and the What-If road-closure API)
+        capacity_factor   -- multiplies usable capacity: <1 = degraded
+                             ("Traffic jam" / a stalled vehicle / a pothole),
+                             >1 = boosted (the "Increase flow" action —
+                             modelling a tidal-lane reversal, a temporary
+                             extra lane, or hard signal priority)
+        zone_type         -- None | "hospital" | "school" | "emergency".
+                             hospital/school roads get a through-traffic
+                             weight penalty (discourage cut-through
+                             driving near sensitive sites); emergency
+                             zones get a much larger penalty so ordinary
+                             routing avoids them, while dispatched
+                             emergency vehicles (green-wave) still use
+                             their own explicit path regardless.
+        expires_at_min    -- None = persistent until manually cleared;
+                             otherwise auto-clears itself on the tick
+                             after this simulated time.
+        label             -- free-text reason, shown in the UI/API.
+    """
     edge: EdgeKey
-    kind: str                  # "stalled_vehicle" | "pothole" | "illegal_parking" | "closure" | "manual_jam"
-    capacity_factor: float     # multiplies the edge's usable capacity, 0 = fully blocked
-    expires_at_min: float
-    predicted_clear_min: float
+    closed: bool = False
+    capacity_factor: float = 1.0
+    zone_type: Optional[str] = None
+    expires_at_min: Optional[float] = None
+    label: str = ""
+
+    def is_default(self) -> bool:
+        return (not self.closed and abs(self.capacity_factor - 1.0) < 1e-6
+                and self.zone_type is None)
+
+
+ZONE_WEIGHT_MULTIPLIER = {"hospital": 1.7, "school": 1.7, "emergency": 8.0}
 
 
 # ===========================================================================
@@ -400,9 +434,15 @@ class TrafficSimulation:
         # measure (it's literally what capacity_veh_per_hr is denominated
         # in, and what the BPR formula was designed around).
         self.edge_entries_since_update: Dict[EdgeKey, int] = {e: 0 for e in G.edges(keys=True)}
-        self.incidents: List[Incident] = []
+        self.edge_overrides: Dict[EdgeKey, EdgeOverride] = {}
         self.signals: Dict[object, SignalController] = build_signals(G, mode=signal_mode)
         self.signal_mode = signal_mode
+
+        # peak-hour surge: an optional temporary network-wide (or
+        # corridor-targeted) demand multiplier — see simulate_peak_surge()
+        self._surge_until_min: float = -1.0
+        self._surge_intensity: float = 1.0
+        self._surge_edge: Optional[EdgeKey] = None
 
         self.history: Dict[EdgeKey, deque] = {
             e: deque(maxlen=180) for e in G.edges(keys=True)
@@ -457,7 +497,7 @@ class TrafficSimulation:
     def tick(self):
         with self._lock:
             self.sim_clock_min += self.dt_min
-            self._expire_incidents()
+            self._expire_overrides()
             self._spawn_vehicles()
             self._advance_vehicles()
             self._update_signals()
@@ -467,7 +507,9 @@ class TrafficSimulation:
     def _spawn_vehicles(self):
         if len(self.vehicles) >= self.max_vehicles:
             return
-        rate = (self.base_spawn_rate_per_min * self.demand_scale
+        surging = self.sim_clock_min < self._surge_until_min
+        intensity = self._surge_intensity if surging else 1.0
+        rate = (self.base_spawn_rate_per_min * self.demand_scale * intensity
                 * demand_multiplier(self.sim_clock_min % 1440.0))
         n_new = _poisson_sample(rate * self.dt_min)
         nodes = list(self.G.nodes)
@@ -476,6 +518,20 @@ class TrafficSimulation:
         for _ in range(n_new):
             if len(self.vehicles) >= self.max_vehicles:
                 break
+            # During a targeted peak-hour surge, bias a share of the new
+            # trips to actually route *through* the picked corridor (real
+            # rush-hour surges concentrate on specific arterials, they
+            # don't spread evenly across the whole city).
+            if surging and self._surge_edge is not None and self.rng.random() < 0.6:
+                su, sv, _ = self._surge_edge
+                origin = self.rng.choice(nodes)
+                dest = self.rng.choice(nodes)
+                head = self._route_edges(origin, su)
+                tail = self._route_edges(sv, dest)
+                if head and tail:
+                    full_route = head + [self._surge_edge] + tail
+                    self._push_vehicle(full_route, is_emergency=False)
+                    continue
             origin = self.rng.choice(nodes)
             dest = self.rng.choice(nodes)
             if origin == dest:
@@ -548,20 +604,93 @@ class TrafficSimulation:
             qb = self._queue_estimate(sig.phase_b)
             sig.update(self.dt_min, qa, qb)
 
-    # ---- incidents ------------------------------------------------------
-    def _expire_incidents(self):
-        self.incidents = [i for i in self.incidents if i.expires_at_min > self.sim_clock_min]
+    # ---- manual/automatic edge overrides ---------------------------------
+    def _get_or_create_override(self, edge: EdgeKey) -> EdgeOverride:
+        ov = self.edge_overrides.get(edge)
+        if ov is None:
+            ov = EdgeOverride(edge=edge)
+            self.edge_overrides[edge] = ov
+        return ov
 
-    def trigger_incident(self, edge: Optional[EdgeKey] = None, kind: str = "stalled_vehicle",
-                          duration_min: float = 20.0, capacity_factor: float = 0.4) -> Incident:
+    def _expire_overrides(self):
+        expired = [e for e, ov in self.edge_overrides.items()
+                   if ov.expires_at_min is not None and ov.expires_at_min <= self.sim_clock_min]
+        for e in expired:
+            del self.edge_overrides[e]
+
+    def set_road_closed(self, edge: EdgeKey, closed: bool) -> EdgeOverride:
+        """The 'Block road' action. Persistent until explicitly reopened."""
         with self._lock:
-            if edge is None:
-                edge = self.rng.choice(list(self.G.edges(keys=True)))
-            inc = Incident(edge=edge, kind=kind, capacity_factor=capacity_factor,
-                            expires_at_min=self.sim_clock_min + duration_min,
-                            predicted_clear_min=duration_min)
-            self.incidents.append(inc)
-            return inc
+            if not closed and edge in self.edge_overrides:
+                ov = self.edge_overrides[edge]
+                ov.closed = False
+                if ov.is_default():
+                    del self.edge_overrides[edge]
+                self._apply_override_now(edge)
+                return ov
+            ov = self._get_or_create_override(edge)
+            ov.closed = closed
+            ov.label = "manually closed" if closed else ov.label
+            self._apply_override_now(edge)
+            return ov
+
+    def set_capacity_factor(self, edge: EdgeKey, factor: float,
+                             duration_min: Optional[float] = None, label: str = "") -> EdgeOverride:
+        """
+        Degrade (factor < 1 — the 'Traffic jam' action / a stalled vehicle,
+        pothole, illegal parking, etc.) or boost (factor > 1 — the
+        'Increase flow' action: temporary extra capacity / signal
+        priority / a tidal-lane reversal) an edge's usable capacity.
+        `duration_min=None` means it persists until reset_edge() is called.
+        """
+        with self._lock:
+            ov = self._get_or_create_override(edge)
+            ov.capacity_factor = max(0.05, factor)
+            ov.expires_at_min = (self.sim_clock_min + duration_min) if duration_min else None
+            ov.label = label or ov.label
+            self._apply_override_now(edge)
+            return ov
+
+    def set_zone(self, edge: EdgeKey, zone_type: Optional[str]) -> Optional[EdgeOverride]:
+        """Tag/untag a road as a hospital / school / emergency zone."""
+        with self._lock:
+            if zone_type is None:
+                if edge in self.edge_overrides:
+                    ov = self.edge_overrides[edge]
+                    ov.zone_type = None
+                    if ov.is_default():
+                        del self.edge_overrides[edge]
+                        self._apply_override_now(edge)
+                        return None
+                    self._apply_override_now(edge)
+                    return ov
+                return None
+            ov = self._get_or_create_override(edge)
+            ov.zone_type = zone_type
+            self._apply_override_now(edge)
+            return ov
+
+    def reset_edge(self, edge: EdgeKey):
+        """Clear every manual override on a segment (the 'Reset segment' action)."""
+        with self._lock:
+            self.edge_overrides.pop(edge, None)
+            self._apply_override_now(edge)
+
+    def simulate_peak_surge(self, edge: Optional[EdgeKey] = None,
+                             duration_min: float = 30.0, intensity: float = 2.6):
+        """
+        The 'Peak-hour surge' action: automatically runs a self-contained
+        rush-hour simulation for `duration_min` — no further manual input
+        needed. Network-wide trip generation is multiplied by `intensity`,
+        and if an edge was selected, a majority of the extra demand is
+        specifically routed through it (real surges concentrate on a
+        corridor, not spread uniformly), so the effect is visible right
+        where the planner clicked.
+        """
+        with self._lock:
+            self._surge_until_min = self.sim_clock_min + duration_min
+            self._surge_intensity = intensity
+            self._surge_edge = edge
 
     def set_demand_scale(self, scale: float):
         """Live control for overall trip-generation intensity — this is what
@@ -569,21 +698,9 @@ class TrafficSimulation:
         with self._lock:
             self.demand_scale = max(0.0, min(scale, 4.0))
 
-    def set_road_closed(self, edge: EdgeKey, closed: bool):
-        with self._lock:
-            self.incidents = [i for i in self.incidents if i.edge != edge]
-            if closed:
-                self.incidents.append(Incident(
-                    edge=edge, kind="closure", capacity_factor=0.0,
-                    expires_at_min=self.sim_clock_min + 10_000.0, predicted_clear_min=0.0,
-                ))
-
-    def _incident_factor(self, edge: EdgeKey) -> float:
-        factor = 1.0
-        for inc in self.incidents:
-            if inc.edge == edge:
-                factor = min(factor, inc.capacity_factor)
-        return factor
+    def _capacity_factor(self, edge: EdgeKey) -> float:
+        ov = self.edge_overrides.get(edge)
+        return ov.capacity_factor if ov else 1.0
 
     # ---- emergency green wave -----------------------------------------
     def emergency_green_wave(self, path_nodes: List[object], vehicle_speed_kmh: float = 60.0,
@@ -616,6 +733,138 @@ class TrafficSimulation:
             ) if len(path_nodes) >= 2 else None
             return veh
 
+    # ---- live vehicle positions (for map animation) ----------------------
+    def _apply_override_now(self, edge: EdgeKey):
+        """
+        Re-derive an edge's weight/congestion immediately after a manual
+        override changes (block/jam/boost/zone/reset), instead of waiting
+        for the next tick — so a route query or reroute preview run right
+        after clicking a button reflects the change instantly. Reuses the
+        last-measured flow (flow_veh_per_hr) against the *new* capacity to
+        get an immediate, still-physically-grounded congestion estimate;
+        the next regular tick will refine it with freshly measured flow.
+        """
+        u, v, k = edge
+        if v not in self.G[u] or k not in self.G[u][v]:
+            return
+        data = self.G[u][v][k]
+        base_capacity = max(data.get("capacity_veh_per_hr", 1800.0), 1e-3)
+        override = self.edge_overrides.get(edge)
+        cap_factor = max(override.capacity_factor if override else 1.0, 1e-3)
+        effective_capacity = base_capacity * cap_factor
+        flow = data.get("flow_veh_per_hr", 0.0)
+        congestion_score = min(flow / effective_capacity, 1.4)
+        data["congestion_score"] = round(congestion_score, 3)
+
+        self._recompute_weight(data)
+        sig = self.signals.get(v)
+        if sig is not None:
+            green_ratio = sig.green_ratio_for(edge)
+            x = min(congestion_score * 1.2, 0.97)
+            delay_s = webster_delay_seconds(sig.cycle_s, green_ratio, x)
+            data["signal_delay_min"] = round(delay_s / 60.0, 3)
+            data["weight"] = round(data["weight"] + data["signal_delay_min"], 4)
+
+        is_closed = bool(override and override.closed)
+        zone_type = override.zone_type if override else None
+        if is_closed:
+            data["weight"] = 1_000_000.0
+            data["congestion_score"] = 1.0
+            data["current_speed_kmh"] = 0.0
+        elif cap_factor < 1.0:
+            data["weight"] = round(data["weight"] * (1.0 + 3.0 * (1.0 - cap_factor)), 4)
+        elif cap_factor > 1.0:
+            data["weight"] = round(data["weight"] / cap_factor, 4)
+        if zone_type and not is_closed:
+            data["weight"] = round(data["weight"] * ZONE_WEIGHT_MULTIPLIER.get(zone_type, 1.0), 4)
+
+        data["zone_type"] = zone_type
+        data["override_label"] = override.label if override else ""
+        data["incident"] = bool(override and (is_closed or cap_factor != 1.0))
+
+    def get_reroute_preview(self, edge: EdgeKey) -> Optional[Dict]:
+        """
+        'If I block/jam this road, what path does through-traffic take
+        instead?' — computes the current cheapest path between the edge's
+        two endpoints under live (post-override) weights and reports which
+        edges it uses, so the frontend can highlight the actual detour on
+        the map using the same geometry it already rendered for those
+        roads. Returns `unchanged: True` when the fastest path still is
+        the original edge (e.g. a mild jam that isn't actually worth
+        detouring around).
+        """
+        u, v, k = edge
+        with self._lock:
+            try:
+                path = nx.dijkstra_path(self.G, u, v, weight="weight")
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                return None
+            total_weight = nx.dijkstra_path_length(self.G, u, v, weight="weight")
+            path_edges = []
+            total_length_m = 0.0
+            for a, b in zip(path[:-1], path[1:]):
+                parallel = self.G[a][b]
+                ek = min(parallel, key=lambda kk: parallel[kk].get("weight", 1e9))
+                path_edges.append([str(a), str(b), str(ek)])
+                total_length_m += parallel[ek].get("length", 0.0)
+            unchanged = (len(path) == 2 and path[0] == u and path[1] == v)
+            return {
+                "edges": path_edges,
+                "time_min": round(total_weight, 2),
+                "distance_m": round(total_length_m, 1),
+                "unchanged": unchanged,
+            }
+
+    def get_vehicle_positions(self, limit: int = 400) -> List[Dict]:
+        """
+        Interpolate every active vehicle's current lat/lng along its
+        current edge from (enter_time, exit_time) — this is what powers
+        the moving-dots live traffic-flow visualisation on the map.
+        Capped at `limit` for render performance; sampled, not truncated,
+        so the on-screen density still reflects the true distribution.
+        """
+        with self._lock:
+            vehicles = list(self.vehicles.values())
+        if len(vehicles) > limit:
+            vehicles = self.rng.sample(vehicles, limit)
+        now = self.sim_clock_min
+        out = []
+        for veh in vehicles:
+            u, v, k = veh.current_edge
+            if u not in self.G.nodes or v not in self.G.nodes:
+                continue
+            span = max(veh.exit_time_min - veh.enter_time_min, 1e-6)
+            frac = min(max((now - veh.enter_time_min) / span, 0.0), 1.0)
+            un, vn = self.G.nodes[u], self.G.nodes[v]
+            lat = un["y"] + (vn["y"] - un["y"]) * frac
+            lng = un["x"] + (vn["x"] - un["x"]) * frac
+            out.append({"id": veh.vid, "lat": round(lat, 6), "lng": round(lng, 6),
+                        "emergency": veh.is_emergency})
+        return out
+
+    # ---- node (intersection) info ---------------------------------------
+    def get_node_info(self, node) -> Optional[Dict]:
+        if node not in self.G.nodes:
+            return None
+        incoming = [(u, node, k) for u, _, k in self.G.in_edges(node, keys=True)]
+        total_vehicles = sum(self.G.edges[e].get("current_volume", 0) for e in incoming)
+        total_queue = sum(self.G.edges[e].get("queue_estimate", 0.0) for e in incoming)
+        scores = [self.G.edges[e].get("congestion_score", 0.0) for e in incoming]
+        avg_congestion = sum(scores) / len(scores) if scores else 0.0
+        sig = self.signals.get(node)
+        return {
+            "node": str(node),
+            "incoming_roads": len(incoming),
+            "vehicles_nearby": total_vehicles,
+            "queue_estimate": round(total_queue, 1),
+            "avg_congestion": round(avg_congestion, 3),
+            "signalized": sig is not None,
+            "signal": ({
+                "mode": sig.mode, "cycle_s": sig.cycle_s,
+                "green_ratio_a": round(sig.green_ratio_a, 2),
+            } if sig is not None else None),
+        }
+
     # ---- state -> graph -------------------------------------------------
     def _update_edge_states(self):
         now = self.sim_clock_min
@@ -631,8 +880,9 @@ class TrafficSimulation:
             length_km = max(data.get("length", 50.0) / 1000.0, 0.01)
             base_capacity = max(data.get("capacity_veh_per_hr", 1800.0), 1e-3)
 
-            incident_factor = max(self._incident_factor(edge), 1e-3)
-            effective_capacity = base_capacity * incident_factor
+            override = self.edge_overrides.get(edge)
+            cap_factor = max(override.capacity_factor if override else 1.0, 1e-3)
+            effective_capacity = base_capacity * cap_factor
 
             # Flow (throughput) is the tick-size-independent congestion
             # signal: how many vehicles actually used this link this tick,
@@ -656,7 +906,7 @@ class TrafficSimulation:
                 # congested branch: solve q = w*(kj-k) => k, then v = q/k
                 k_est = max(kj - equivalent_flow_per_lane / max(w, 1e-3), kc)
                 speed_kmh = fd_speed(k_est, data.get("free_flow_speed_kmh", 30.0), kc, kj, w)
-            speed_kmh *= max(incident_factor, 0.02)
+            speed_kmh *= max(min(cap_factor, 1.0), 0.02)  # a boost (>1) doesn't raise physical speed limits
 
             # Not clamped to 1.0: values up to 1.4 represent real
             # oversaturation and are meant to feed extra BPR penalty into
@@ -682,7 +932,9 @@ class TrafficSimulation:
             else:
                 data["signal_delay_min"] = 0.0
 
-            is_closed = any(i.edge == edge and i.kind == "closure" for i in self.incidents)
+            is_closed = bool(override and override.closed)
+            zone_type = override.zone_type if override else None
+
             if is_closed:
                 # A closure isn't "4x slower" — it's unroutable. Push the
                 # weight far above anything Dijkstra would ever prefer
@@ -690,12 +942,18 @@ class TrafficSimulation:
                 data["weight"] = 1_000_000.0
                 data["congestion_score"] = 1.0
                 data["current_speed_kmh"] = 0.0
-                data["incident"] = True
-            elif incident_factor < 1.0:
-                data["weight"] = round(data["weight"] * (1.0 + 3.0 * (1.0 - incident_factor)), 4)
-                data["incident"] = True
-            else:
-                data["incident"] = False
+            elif cap_factor < 1.0:
+                data["weight"] = round(data["weight"] * (1.0 + 3.0 * (1.0 - cap_factor)), 4)
+            elif cap_factor > 1.0:
+                # a capacity boost also directly relieves travel time
+                data["weight"] = round(data["weight"] / cap_factor, 4)
+
+            if zone_type and not is_closed:
+                data["weight"] = round(data["weight"] * ZONE_WEIGHT_MULTIPLIER.get(zone_type, 1.0), 4)
+
+            data["zone_type"] = zone_type
+            data["override_label"] = override.label if override else ""
+            data["incident"] = bool(override and (is_closed or cap_factor != 1.0))
 
             emis_rate = co2_g_per_km(max(speed_kmh, 3.0))
             co2_g = emis_rate * (volume * length_km) if speed_kmh > 3.0 else volume * idling_co2_g_per_min() * self.dt_min
@@ -761,11 +1019,14 @@ class TrafficSimulation:
                     self.total_travel_time_min / self.trips_completed, 2
                 ) if self.trips_completed else None,
                 "avg_network_load": round(avg_load, 3),
-                "active_incidents": [
-                    {"edge": list(map(str, i.edge)), "kind": i.kind,
-                     "capacity_factor": i.capacity_factor,
-                     "clears_in_min": round(i.expires_at_min - self.sim_clock_min, 1)}
-                    for i in self.incidents
+                "peak_surge_active": self.sim_clock_min < self._surge_until_min,
+                "active_overrides": [
+                    {"edge": list(map(str, e)), "closed": ov.closed,
+                     "capacity_factor": ov.capacity_factor, "zone_type": ov.zone_type,
+                     "label": ov.label,
+                     "clears_in_min": (round(ov.expires_at_min - self.sim_clock_min, 1)
+                                       if ov.expires_at_min is not None else None)}
+                    for e, ov in self.edge_overrides.items()
                 ],
                 "total_co2_kg": round(self.total_co2_g / 1000.0, 2),
                 "signals": {
@@ -778,8 +1039,14 @@ class TrafficSimulation:
                         "weight": d.get("weight"),
                         "current_speed_kmh": d.get("current_speed_kmh"),
                         "current_volume": d.get("current_volume"),
+                        "flow_veh_per_hr": d.get("flow_veh_per_hr"),
                         "queue_estimate": d.get("queue_estimate"),
                         "incident": d.get("incident", False),
+                        "closed": bool(self.edge_overrides.get((u, v, k)) and self.edge_overrides[(u, v, k)].closed),
+                        "capacity_factor": (self.edge_overrides[(u, v, k)].capacity_factor
+                                             if (u, v, k) in self.edge_overrides else 1.0),
+                        "zone_type": d.get("zone_type"),
+                        "override_label": d.get("override_label", ""),
                         "signal_delay_min": d.get("signal_delay_min", 0.0),
                     }
                     for u, v, k, d in edges

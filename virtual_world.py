@@ -452,29 +452,118 @@ def api_simulate_stop():
     return jsonify({"running": SIM.running})
 
 
-@app.route("/api/simulate/incident", methods=["POST"])
-def api_simulate_incident():
-    """
-    Body: {"u":.., "v":.., "k":.., "kind": "stalled_vehicle"|"pothole"|
-           "illegal_parking"|"manual_jam", "duration_min": 20,
-           "capacity_factor": 0.4}
-    Omit u/v to drop a random incident on the network.
-    """
+@app.route("/api/simulate/reroute_preview")
+def api_simulate_reroute_preview():
+    """Example: /api/simulate/reroute_preview?u=4&v=5&k=0
+    After a block/jam/boost action, this reports the current cheapest
+    path between the edge's endpoints so the frontend can highlight the
+    detour real traffic would now take."""
+    edge = _find_edge(request.args.get("u"), request.args.get("v"), request.args.get("k"))
+    if edge is None:
+        return jsonify({"error": "no such edge"}), 404
+    preview = SIM.get_reroute_preview(edge)
+    if preview is None:
+        return jsonify({"error": "no path found"}), 404
+    return jsonify(preview)
+
+
+@app.route("/api/simulate/jam", methods=["POST"])
+def api_simulate_jam():
+    """Body: {"u":.., "v":.., "k":.., "duration_min": 15, "capacity_factor": 0.35}
+    The 'Traffic jam' action — degrades a road's usable capacity for a
+    limited time (a stalled vehicle, a pothole, an accident, ...)."""
+    body = request.get_json(silent=True) or {}
+    edge = _find_edge(body.get("u"), body.get("v"), body.get("k"))
+    if edge is None:
+        return jsonify({"error": "no such edge"}), 404
+    ov = SIM.set_capacity_factor(
+        edge, factor=float(body.get("capacity_factor", 0.35)),
+        duration_min=float(body.get("duration_min", 15.0)), label=body.get("label", "traffic jam"),
+    )
+    return jsonify({"edge": [str(x) for x in edge], "capacity_factor": ov.capacity_factor,
+                    "clears_in_min": ov.expires_at_min})
+
+
+@app.route("/api/simulate/boost", methods=["POST"])
+def api_simulate_boost():
+    """Body: {"u":.., "v":.., "k":.., "duration_min": 15, "capacity_factor": 1.6}
+    The 'Increase flow' action — temporarily boosts a road's usable
+    capacity (extra lane / tidal-lane reversal / hard signal priority)."""
+    body = request.get_json(silent=True) or {}
+    edge = _find_edge(body.get("u"), body.get("v"), body.get("k"))
+    if edge is None:
+        return jsonify({"error": "no such edge"}), 404
+    ov = SIM.set_capacity_factor(
+        edge, factor=float(body.get("capacity_factor", 1.6)),
+        duration_min=float(body.get("duration_min", 15.0)), label=body.get("label", "flow boost"),
+    )
+    return jsonify({"edge": [str(x) for x in edge], "capacity_factor": ov.capacity_factor,
+                    "clears_in_min": ov.expires_at_min})
+
+
+@app.route("/api/simulate/reset", methods=["POST"])
+def api_simulate_reset():
+    """Body: {"u":.., "v":.., "k":..} — clears every manual override on a segment."""
+    body = request.get_json(silent=True) or {}
+    edge = _find_edge(body.get("u"), body.get("v"), body.get("k"))
+    if edge is None:
+        return jsonify({"error": "no such edge"}), 404
+    SIM.reset_edge(edge)
+    return jsonify({"edge": [str(x) for x in edge], "reset": True})
+
+
+@app.route("/api/simulate/zone", methods=["POST"])
+def api_simulate_zone():
+    """Body: {"u":.., "v":.., "k":.., "zone_type": "hospital"|"school"|"emergency"|null}"""
+    body = request.get_json(silent=True) or {}
+    edge = _find_edge(body.get("u"), body.get("v"), body.get("k"))
+    if edge is None:
+        return jsonify({"error": "no such edge"}), 404
+    zone_type = body.get("zone_type")
+    if zone_type not in (None, "hospital", "school", "emergency"):
+        return jsonify({"error": "zone_type must be hospital, school, emergency, or null"}), 400
+    SIM.set_zone(edge, zone_type)
+    return jsonify({"edge": [str(x) for x in edge], "zone_type": zone_type})
+
+
+@app.route("/api/simulate/peak_surge", methods=["POST"])
+def api_simulate_peak_surge():
+    """Body: {"u":.., "v":.., "k":.., "duration_min": 30, "intensity": 2.6}
+    The 'Peak-hour surge' action — automatically runs a self-contained
+    rush-hour simulation; u/v/k are optional (omit for a network-wide
+    surge instead of one concentrated on a corridor)."""
     body = request.get_json(silent=True) or {}
     edge = None
     if "u" in body and "v" in body:
         edge = _find_edge(body["u"], body["v"], body.get("k"))
-        if edge is None:
-            return jsonify({"error": "no such edge"}), 404
-    inc = SIM.trigger_incident(
-        edge=edge,
-        kind=body.get("kind", "stalled_vehicle"),
-        duration_min=float(body.get("duration_min", 20.0)),
-        capacity_factor=float(body.get("capacity_factor", 0.4)),
+    SIM.simulate_peak_surge(
+        edge=edge, duration_min=float(body.get("duration_min", 30.0)),
+        intensity=float(body.get("intensity", 2.6)),
     )
-    return jsonify({"edge": [str(x) for x in inc.edge], "kind": inc.kind,
-                    "capacity_factor": inc.capacity_factor,
-                    "clears_in_min": inc.predicted_clear_min})
+    return jsonify({"edge": [str(x) for x in edge] if edge else None,
+                    "duration_min": body.get("duration_min", 30.0)})
+
+
+@app.route("/api/simulate/vehicles")
+def api_simulate_vehicles():
+    """Live vehicle positions (interpolated lat/lng) for the moving-dots
+    traffic-flow visualisation. ?limit=400 caps how many are returned."""
+    limit = request.args.get("limit", default=400, type=int)
+    return jsonify({"vehicles": SIM.get_vehicle_positions(limit=limit)})
+
+
+@app.route("/api/simulate/node")
+def api_simulate_node():
+    """Example: /api/simulate/node?id=48 — aggregated stats + signal state
+    for an intersection, shown when a node is clicked on the map."""
+    node_id = request.args.get("id")
+    if node_id is None:
+        return jsonify({"error": "id query param required"}), 400
+    node = int(node_id) if node_id.lstrip("-").isdigit() else node_id
+    info = SIM.get_node_info(node)
+    if info is None:
+        return jsonify({"error": "no such node"}), 404
+    return jsonify(info)
 
 
 @app.route("/api/simulate/demand", methods=["POST"])
