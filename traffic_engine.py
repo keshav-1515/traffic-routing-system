@@ -1215,32 +1215,56 @@ class TrafficSimulation:
                 "unchanged": unchanged,
             }
 
-    def get_vehicle_positions(self, limit: int = 400) -> List[Dict]:
+    def get_vehicle_positions(self, limit: int = 400, sample_every: int = 1) -> Dict:
         """
-        Interpolate every active vehicle's current lat/lng along its
-        current edge from (enter_time, exit_time) — this is what powers
-        the moving-dots live traffic-flow visualisation on the map.
-        Capped at `limit` for render performance; sampled, not truncated,
-        so the on-screen density still reflects the true distribution.
+        Returns each active vehicle's CURRENT EDGE and its enter/exit time
+        window, not a single precomputed lat/lng. The client extrapolates
+        position along that edge locally (the same technique the drive-car
+        marker uses) instead of linearly interpolating between two raw
+        poll snapshots - interpolating raw points is what let a vehicle
+        that changed roads between polls draw a straight line cutting
+        across open ground instead of following the turn. Extrapolating
+        along the edge geometry means a vehicle is mathematically
+        guaranteed to sit on a road at every animation frame.
+
+        `sample_every` (the "1 marker per N vehicles" density control) is
+        applied first, using `vid % sample_every == 0` rather than a fresh
+        random draw each call. That keeps the *same* subset of vehicles
+        visible from one poll to the next (as long as they're still on the
+        road) instead of reshuffling which ones are shown every refresh,
+        which is what made the dots look like they were skipping frames.
+        Emergency vehicles are always included regardless of sampling, since
+        those are rare and important to keep visible. `limit` remains as a
+        hard safety cap for render performance after sampling is applied.
         """
         with self._lock:
             vehicles = list(self.vehicles.values())
+            sim_clock_min = self.sim_clock_min
+        if sample_every > 1:
+            vehicles = [v for v in vehicles if v.is_emergency or v.vid % sample_every == 0]
         if len(vehicles) > limit:
             vehicles = self.rng.sample(vehicles, limit)
-        now = self.sim_clock_min
         out = []
         for veh in vehicles:
             u, v, k = veh.current_edge
             if u not in self.G.nodes or v not in self.G.nodes:
                 continue
-            span = max(veh.exit_time_min - veh.enter_time_min, 1e-6)
-            frac = min(max((now - veh.enter_time_min) / span, 0.0), 1.0)
             un, vn = self.G.nodes[u], self.G.nodes[v]
-            lat = un["y"] + (vn["y"] - un["y"]) * frac
-            lng = un["x"] + (vn["x"] - un["x"]) * frac
-            out.append({"id": veh.vid, "lat": round(lat, 6), "lng": round(lng, 6),
-                        "emergency": veh.is_emergency})
-        return out
+            out.append({
+                "id": veh.vid,
+                "emergency": veh.is_emergency,
+                "u_coords": [un["x"], un["y"]],
+                "v_coords": [vn["x"], vn["y"]],
+                "enter_time_min": round(veh.enter_time_min, 4),
+                "exit_time_min": round(veh.exit_time_min, 4),
+            })
+        return {
+            "vehicles": out,
+            "sim_clock_min": round(sim_clock_min, 4),
+            "tick_seconds": self.tick_seconds,
+            "sim_minutes_per_tick": self.dt_min,
+        }
+
 
     # ---- node (intersection) info ---------------------------------------
     def get_node_info(self, node) -> Optional[Dict]:

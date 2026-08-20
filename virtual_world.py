@@ -20,6 +20,8 @@ Run:
     python virtual_world.py --place "Koramangala, Bangalore, India"
     python virtual_world.py --bbox 12.935 12.925 77.635 77.615   # north south east west
     python virtual_world.py                                     # synthetic grid (offline demo only)
+
+    python virtual_world.py --place "Katpadi, Vellore, Tamil Nadu, India"
 """
 
 import argparse
@@ -752,10 +754,18 @@ def api_simulate_peak_surge():
 
 @app.route("/api/simulate/vehicles")
 def api_simulate_vehicles():
-    """Live vehicle positions (interpolated lat/lng) for the moving-dots
-    traffic-flow visualisation. ?limit=400 caps how many are returned."""
+    """Live vehicle positions for the moving-dots traffic-flow visualisation.
+    Returns each vehicle's current road edge + timing window (not a single
+    precomputed point) so the client can extrapolate motion smoothly along
+    the road itself. ?limit=400 caps how many are returned. ?sample_every=100
+    shows roughly 1 vehicle marker for every 100 active vehicles (a stable,
+    deterministic subset - not a random one - so the same cars stay visible
+    between polls instead of flickering)."""
     limit = request.args.get("limit", default=400, type=int)
-    return jsonify({"vehicles": SIM.get_vehicle_positions(limit=limit)})
+    sample_every = request.args.get("sample_every", default=1, type=int)
+    result = SIM.get_vehicle_positions(limit=limit, sample_every=max(sample_every, 1))
+    result["sample_every"] = max(sample_every, 1)
+    return jsonify(result)
 
 
 @app.route("/api/simulate/node")
@@ -1057,4 +1067,14 @@ if __name__ == "__main__":
                signal_mode=args.signal_mode, tick_seconds=args.tick_seconds,
                sim_minutes_per_tick=args.sim_minutes_per_tick,
                autostart=not args.no_autostart)
-    app.run(host="0.0.0.0", port=args.port, debug=True, use_reloader=False)
+    # threaded=True matters a lot here: once a drive session is active, the
+    # dashboard has THREE polling loops hitting the server concurrently
+    # (sim-state every 3s, vehicle positions every 1.5s, drive-state every
+    # 1s). Flask's dev server defaults to handling one request at a time,
+    # so those polls alone were enough to starve out the click-triggered
+    # block/jam/boost POST requests behind the polling queue - which is
+    # why road edits looked like they silently stopped working the moment
+    # a drive started, even though the underlying simulate/* handlers never
+    # blocked them. Threaded mode lets the edit POST jump the queue instead
+    # of waiting behind whichever poll got there first.
+    app.run(host="0.0.0.0", port=args.port, debug=True, use_reloader=False, threaded=True)

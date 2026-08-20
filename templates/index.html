@@ -20,6 +20,8 @@
     --text-faint: #98a2b3;
     --accent: #5b5ff0;
     --accent-rgb: 91, 95, 240;
+    --vehicle-color: #fb923c;
+    --vehicle-color-rgb: 251, 146, 60;
     --accent-dark: #4640d1;
     --low: #16a34a;
     --low-rgb: 22, 163, 74;
@@ -161,12 +163,17 @@
   .gauge-wrap { display: flex; align-items: center; gap: 12px; margin-top: 6px; }
   #load-gauge {
     --pct: 0;
+    position: relative;
     width: 56px; height: 56px; border-radius: 50%; flex-shrink: 0;
     background: conic-gradient(var(--accent) calc(var(--pct) * 1%), #e5e7f0 0);
     display: flex; align-items: center; justify-content: center;
   }
-  #load-gauge::before { content: ''; width: 42px; height: 42px; border-radius: 50%; background: var(--panel-2); }
-  #load-value { position: absolute; margin-left: -38px; font-size: 12px; font-weight: 700; color: var(--text); }
+  #load-gauge::before { content: ''; position: absolute; inset: 7px; border-radius: 50%; background: var(--panel-2); }
+  #load-value {
+    position: absolute; inset: 0; z-index: 1;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px; font-weight: 700; color: var(--text);
+  }
 
   .swatch-row { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim); margin: 3px 0; }
   .swatch { width: 11px; height: 11px; border-radius: 3px; flex-shrink: 0; }
@@ -272,11 +279,13 @@
     border: none; background: var(--panel-2); color: var(--text-dim); font-weight: 600;
   }
 
-  /* ---- vehicle markers ---- */
+  /* ---- vehicle markers ----
+     Deliberately NOT var(--accent) - that's the same indigo used for the
+     intersection/node dots, which made moving vehicles and static nodes
+     visually indistinguishable on the map. */
   .veh-dot {
-    width: 6px; height: 6px; border-radius: 50%; background: var(--accent); border: 1px solid #fff;
-    box-shadow: 0 0 3px rgba(var(--accent-rgb),0.7);
-    transition: transform 1.6s linear;
+    width: 6px; height: 6px; border-radius: 50%; background: var(--vehicle-color); border: 1px solid #fff;
+    box-shadow: 0 0 3px rgba(var(--vehicle-color-rgb),0.7);
   }
   .veh-dot.emergency {
     width: 9px; height: 9px; background: #f43f5e; border: 1px solid #fff;
@@ -509,27 +518,37 @@
       <div class="section-label">Live simulation</div>
       <div class="stat-row"><span class="k">Sim clock</span><span class="v" id="sim-clock">–</span></div>
       <div class="stat-row"><span class="k">Active vehicles</span><span class="v" id="sim-vehicles">–</span></div>
-      <div class="stat-row"><span class="k">Trips completed</span><span class="v" id="sim-trips">–</span></div>
       <div class="stat-row"><span class="k">Avg travel time</span><span class="v" id="sim-avgtime">–</span></div>
       <div class="stat-row"><span class="k">Roads under override</span><span class="v" id="sim-overrides">–</span></div>
       <div class="stat-row"><span class="k">Peak-hour surge</span><span class="v" id="sim-surge">–</span></div>
       <div class="stat-row"><span class="k">CO₂ emitted</span><span class="v" id="sim-co2">–</span></div>
+      <div class="route-field" style="margin-top:10px;margin-bottom:0;">
+        <label style="display:block;font-size:11px;color:var(--text-faint);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.4px;font-weight:700;">Vehicle markers on map</label>
+        <select id="veh-density-select" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);font-size:12.5px;">
+          <option value="1">Show all</option>
+          <option value="25">1 per 25 vehicles</option>
+          <option value="50" selected>1 per 50 vehicles</option>
+          <option value="100">1 per 100 vehicles</option>
+          <option value="200">1 per 200 vehicles</option>
+          <option value="500">1 per 500 vehicles</option>
+        </select>
+      </div>
     </div>
 
     <div class="card">
       <div class="section-label">Network load</div>
       <div class="gauge-wrap">
-        <div id="load-gauge"></div>
-        <span id="load-value">–</span>
+        <div id="load-gauge"><span id="load-value">–</span></div>
       </div>
     </div>
+
 
     <div class="card">
       <div class="section-label">Congestion legend</div>
       <div class="swatch-row"><span class="swatch" style="background:#16a34a"></span> Free-flowing (&lt; 0.4)</div>
       <div class="swatch-row"><span class="swatch" style="background:#d97706"></span> Moderate (0.4 – 0.7)</div>
       <div class="swatch-row"><span class="swatch" style="background:#dc2626"></span> Congested (≥ 0.7)</div>
-      <div class="swatch-row"><span class="swatch" style="background:#5b5ff0;border-radius:50%"></span> Moving vehicle</div>
+      <div class="swatch-row"><span class="swatch" style="background:var(--vehicle-color);border-radius:50%"></span> Moving vehicle</div>
       <div class="swatch-row"><span class="swatch" style="background:#f43f5e;border-radius:50%"></span> Emergency vehicle</div>
     </div>
 
@@ -1386,27 +1405,76 @@
   // ------------------------------------------------------------------
   // Live vehicle-flow visualisation (moving dots)
   // ------------------------------------------------------------------
-  const vehicleMarkers = new Map();
+  // Each vehicle's position is extrapolated along its CURRENT ROAD EDGE
+  // using the sim clock, exactly like the drive-car marker (driveAnimTick)
+  // above - never by drawing a straight line between two raw poll
+  // snapshots. That distinction matters: a vehicle can change roads at an
+  // intersection between polls, and lerping raw lat/lng points would cut
+  // a diagonal line straight across open ground instead of following the
+  // turn. Extrapolating along (u_coords -> v_coords, enter_time, exit_time)
+  // keeps every dot mathematically on a road at all times.
+  const vehicleMarkers = new Map(); // id -> { marker, u_coords, v_coords, enter_time_min, exit_time_min }
+  let vehDensitySelect = document.getElementById('veh-density-select');
+  let vehAnimHandle = null;
+  let vehSimClockMin = 0, vehTickSeconds = 2.0, vehSimMinutesPerTick = 1.0, vehFetchedAtMs = 0;
+
+  function vehicleSampleEvery() {
+    return vehDensitySelect ? parseInt(vehDensitySelect.value, 10) || 1 : 50;
+  }
+
   function refreshVehicles() {
-    fetch('/api/simulate/vehicles?limit=350')
+    const sampleEvery = vehicleSampleEvery();
+    fetch(`/api/simulate/vehicles?limit=350&sample_every=${sampleEvery}`)
       .then(res => res.json())
       .then(data => {
+        vehSimClockMin = data.sim_clock_min;
+        vehTickSeconds = data.tick_seconds;
+        vehSimMinutesPerTick = data.sim_minutes_per_tick;
+        vehFetchedAtMs = performance.now();
+
         const seen = new Set();
         data.vehicles.forEach(v => {
           seen.add(v.id);
-          let marker = vehicleMarkers.get(v.id);
-          if (!marker) {
+          let entry = vehicleMarkers.get(v.id);
+          if (!entry) {
             const icon = L.divIcon({ className: '', html: `<div class="veh-dot${v.emergency ? ' emergency' : ''}"></div>`, iconSize: [8, 8] });
-            marker = L.marker([v.lat, v.lng], { icon, interactive: false }).addTo(map);
-            vehicleMarkers.set(v.id, marker);
+            const [ulng, ulat] = v.u_coords;
+            const marker = L.marker([ulat, ulng], { icon, interactive: false }).addTo(map);
+            entry = { marker };
+            vehicleMarkers.set(v.id, entry);
           }
-          marker.setLatLng([v.lat, v.lng]);
+          entry.u_coords = v.u_coords;
+          entry.v_coords = v.v_coords;
+          entry.enter_time_min = v.enter_time_min;
+          entry.exit_time_min = v.exit_time_min;
         });
-        for (const [id, marker] of vehicleMarkers) {
-          if (!seen.has(id)) { map.removeLayer(marker); vehicleMarkers.delete(id); }
+        for (const [id, entry] of vehicleMarkers) {
+          if (!seen.has(id)) { map.removeLayer(entry.marker); vehicleMarkers.delete(id); }
         }
+        if (!vehAnimHandle) vehAnimHandle = requestAnimationFrame(vehicleAnimTick);
       })
       .catch(() => {});
+  }
+
+  function vehicleAnimTick() {
+    const elapsedMs = performance.now() - vehFetchedAtMs;
+    const simMinPerRealMs = vehSimMinutesPerTick / (vehTickSeconds * 1000);
+    const estSimNow = vehSimClockMin + elapsedMs * simMinPerRealMs;
+
+    for (const entry of vehicleMarkers.values()) {
+      const [ulng, ulat] = entry.u_coords;
+      const [vlng, vlat] = entry.v_coords;
+      const span = Math.max(entry.exit_time_min - entry.enter_time_min, 1e-6);
+      const frac = Math.min(Math.max((estSimNow - entry.enter_time_min) / span, 0), 1);
+      const lat = ulat + (vlat - ulat) * frac;
+      const lng = ulng + (vlng - ulng) * frac;
+      entry.marker.setLatLng([lat, lng]);
+    }
+    vehAnimHandle = vehicleMarkers.size ? requestAnimationFrame(vehicleAnimTick) : null;
+  }
+
+  if (vehDensitySelect) {
+    vehDensitySelect.addEventListener('change', refreshVehicles);
   }
 
   // ------------------------------------------------------------------
@@ -1435,7 +1503,6 @@
 
         document.getElementById('sim-clock').textContent = data.sim_day_hhmm;
         document.getElementById('sim-vehicles').textContent = data.active_vehicles;
-        document.getElementById('sim-trips').textContent = data.trips_completed;
         document.getElementById('sim-avgtime').textContent = data.avg_travel_time_min != null ? `${data.avg_travel_time_min} min` : '–';
         document.getElementById('sim-overrides').textContent = data.active_overrides.length;
         document.getElementById('sim-surge').textContent = data.peak_surge_active ? 'Active' : 'Off';
