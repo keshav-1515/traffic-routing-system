@@ -1,0 +1,42 @@
+camera_id: camera_01
+
+video_source: videos/traffic.mp4
+
+video:
+  target_fps: 5
+  loop: false
+  resize_width: 1280
+
+model:
+  weights: yolov8s.pt
+  confidence: 0.20
+  device: auto
+
+classes:
+  car: 2
+  motorcycle: 3
+  bus: 5
+  truck: 7
+
+roi:
+  polygon:
+    - [0, 350]
+    - [1920, 350]
+    - [1920, 1080]
+    - [0, 1080]
+
+counting_zones:
+  - id: main_road
+    polygon:
+      - [100, 550]
+      - [1820, 550]
+      - [1900, 1080]
+      - [20, 1080]
+
+tracking:
+  backend: bytetrack
+
+speed:
+  enabled: false
+  pixels_per_meter: null
+  smoothing_window: 5
