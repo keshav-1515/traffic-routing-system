@@ -32,6 +32,12 @@ import networkx as nx
 from flask import Flask, jsonify, render_template, request
 
 import traffic_engine
+import time
+# CV engine integration
+try:
+    from cv_engine import DEFAULT_CV
+except Exception:
+    DEFAULT_CV = None
 
 try:
     import cv2
@@ -150,7 +156,17 @@ def recompute_weight(data):
     the standard BPR congestion function used in real traffic models.
     """
     penalty = 1 + BPR_ALPHA * (data.get("congestion_score", 0.0) ** BPR_BETA)
-    data["weight"] = round(data["free_flow_time_min"] * penalty, 4)
+    base = data["free_flow_time_min"] * penalty
+    # incident penalty: if an incident is present, scale travel time up
+    incident_info = data.get("incident_info")
+    if incident_info:
+        try:
+            sev = float(incident_info.get("severity", 0.7))
+        except Exception:
+            sev = 0.7
+        INCIDENT_WEIGHT_ALPHA = 3.0
+        base = base * (1.0 + INCIDENT_WEIGHT_ALPHA * sev)
+    data["weight"] = round(base, 4)
     return data["weight"]
 
 
@@ -482,6 +498,31 @@ def init_graph(place=None, bbox=None, dist=1500, signal_mode="adaptive",
         SIM.start()
         print(f"[sim] Live traffic simulation started "
               f"(tick every {tick_seconds}s = {sim_minutes_per_tick} sim-min, signals: {signal_mode})")
+    # start CV manager in mock mode by default so /api/cv/metrics is available
+    try:
+        if DEFAULT_CV is not None:
+            DEFAULT_CV.mode = 'mock'
+            DEFAULT_CV.start()
+            print('[cv] DEFAULT_CV started (mock)')
+    except Exception:
+        pass
+    # background thread: push CV metrics into SIM for incident detection
+    try:
+        import threading
+        def _push_cv_loop():
+            while True:
+                try:
+                    if DEFAULT_CV is not None and SIM is not None:
+                        m = DEFAULT_CV.get_metrics()
+                        if hasattr(SIM, 'set_external_cv_metrics'):
+                            SIM.set_external_cv_metrics(m)
+                except Exception:
+                    pass
+                time.sleep(1.0)
+        t = threading.Thread(target=_push_cv_loop, daemon=True)
+        t.start()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -610,12 +651,93 @@ def api_route():
     if source is None or target is None:
         return jsonify({"error": "source and target query params are required"}), 400
     try:
-        result = shortest_path(ROAD_GRAPH, source, target, by=by)
+        # current (live) best route under current weights
+        current = shortest_path(ROAD_GRAPH, source, target, by=by)
     except nx.NetworkXNoPath:
         return jsonify({"error": f"no path between {source} and {target}"}), 404
     except nx.NodeNotFound as e:
         return jsonify({"error": str(e)}), 404
-    return jsonify(result)
+
+    # Build baseline graph copy with incident-free weights (if SIM present)
+    baseline_eta = None
+    recommended = None
+    time_saved_min = 0.0
+    co2_saved_g = 0.0
+    rerouted = False
+    rerouting_reason = None
+    MIN_ETA_IMPROVEMENT_SECONDS = 30
+
+    try:
+        if SIM is not None and hasattr(SIM, 'incidents') and SIM.incidents:
+            # baseline: copy graph and restore original weights on incident edges
+            H = ROAD_GRAPH.copy()
+            for inc in SIM.incidents.values():
+                e = inc.edge
+                if e in H.edges:
+                    if inc.original_weight is not None:
+                        H.edges[e]["weight"] = inc.original_weight
+            # compute baseline route
+            base = shortest_path(H, source, target, by=by)
+            baseline_eta = base.get("time_min")
+
+            # alternative avoiding incident edges: heavily penalise incident edges
+            H2 = ROAD_GRAPH.copy()
+            for inc in SIM.incidents.values():
+                e = inc.edge
+                if e in H2.edges:
+                    H2.edges[e]["weight"] = 1_000_000.0
+            try:
+                alt = shortest_path(H2, source, target, by=by)
+            except Exception:
+                alt = None
+
+            # Compare current live ETA vs alternative avoiding incidents
+            current_time = current.get("time_min")
+            if current_time is not None and alt is not None:
+                alt_time = alt.get("time_min")
+                if alt_time is not None and (current_time - alt_time) * 60.0 >= MIN_ETA_IMPROVEMENT_SECONDS:
+                    rerouted = True
+                    recommended = alt
+                    rerouting_reason = "incident_avoidance"
+
+                # estimate CO2 saved by switching from current route to alt route
+                def estimate_co2(route):
+                    total_g = 0.0
+                    coords = route.get("path", [])
+                    for a, b in zip(coords[:-1], coords[1:]):
+                        try:
+                            u = int(a) if str(a).lstrip('-').isdigit() else a
+                            v = int(b) if str(b).lstrip('-').isdigit() else b
+                        except Exception:
+                            u, v = a, b
+                        if v in ROAD_GRAPH[u]:
+                            d = min(ROAD_GRAPH[u][v].values(), key=lambda dd: dd.get('weight', dd.get('free_flow_time_min', 1.0)))
+                            length_km = d.get('length', 0.0) / 1000.0
+                            speed = d.get('current_speed_kmh', d.get('free_flow_speed_kmh', 30.0))
+                            total_g += traffic_engine.co2_g_per_km(max(speed, 2.0)) * length_km
+                    return total_g
+
+                try:
+                    orig_co2 = estimate_co2(current)
+                    alt_co2 = estimate_co2(alt)
+                    co2_saved_g = max(0.0, orig_co2 - alt_co2)
+                    time_saved_min = max(0.0, current_time - alt_time)
+                except Exception:
+                    co2_saved_g = 0.0
+    except Exception:
+        baseline_eta = None
+
+    out = {
+        **current,
+        "baseline_eta_min": baseline_eta,
+        "recommended": bool(rerouted),
+        "recommended_route": recommended,
+        "time_saved_min": round(time_saved_min, 3),
+        "co2_saved_g": round(co2_saved_g, 1),
+        "rerouting_reason": rerouting_reason,
+    }
+
+    return jsonify(out)
 
 
 def _graph_center():
@@ -643,7 +765,14 @@ def _find_edge(u, v, k=None):
 def api_simulate_state():
     """Live snapshot: sim clock, active vehicles, incidents, signals, CO2,
     and per-edge congestion/speed/queue — everything the dashboard polls."""
-    return jsonify(SIM.get_state())
+    state = SIM.get_state()
+    # attach latest CV metrics if available
+    try:
+        if DEFAULT_CV is not None:
+            state['cv_metrics'] = DEFAULT_CV.get_metrics()
+    except Exception:
+        state['cv_metrics'] = None
+    return jsonify(state)
 
 
 @app.route("/api/simulate/start", methods=["POST"])
@@ -791,6 +920,92 @@ def api_simulate_closure():
         return jsonify({"error": "no such edge"}), 404
     SIM.set_road_closed(edge, bool(body.get("closed", True)))
     return jsonify({"edge": [str(x) for x in edge], "closed": bool(body.get("closed", True))})
+
+
+@app.route("/api/demo/scenario", methods=["POST"])
+def api_demo_scenario():
+    """Trigger or clear a deterministic demo incident.
+
+    Body: {"action": "trigger"} or {"action": "clear"}
+    """
+    body = request.get_json(silent=True) or {}
+    action = body.get("action")
+    if action == "trigger":
+        # For the synthetic grid demo, pick a central horizontal edge so
+        # the incident reliably sits on many shortest paths across the grid
+        try:
+            if USING_SYNTHETIC:
+                # grid params are the defaults used by build_synthetic_grid
+                rows = 8
+                cols = 8
+                mid_r = rows // 2
+                mid_c = cols // 2
+                u = mid_r * cols + mid_c
+                v = mid_r * cols + (mid_c + 1)
+                # find the exact key for the parallel edge
+                k = next(iter(ROAD_GRAPH[u][v]))
+                edge = (u, v, k)
+                inc = SIM.trigger_incident(edge, incident_type="stalled_vehicle", severity=0.95, confidence=0.2, blocked_fraction=0.9)
+                # recommend a demonstrative src/dst across the row
+                demo_src = mid_r * cols + 0
+                demo_dst = mid_r * cols + (cols - 1)
+                return jsonify({"status": "triggered", "incident": inc.summary(), "demo_src": demo_src, "demo_dst": demo_dst})
+            else:
+                # fallback: pick the first routable edge
+                for u, v, k in ROAD_GRAPH.edges(keys=True):
+                    edge = (u, v, k)
+                    try:
+                        inc = SIM.trigger_incident(edge, incident_type="stalled_vehicle", severity=0.95, confidence=0.2, blocked_fraction=0.9)
+                        return jsonify({"status": "triggered", "incident": inc.summary()})
+                    except Exception:
+                        continue
+                return jsonify({"error": "no edge available to trigger incident"}), 500
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    elif action == "clear":
+        n = SIM.clear_all_incidents()
+        return jsonify({"status": "cleared", "cleared": n})
+    else:
+        return jsonify({"error": "action must be 'trigger' or 'clear'"}), 400
+
+
+@app.route("/api/incidents")
+def api_incidents():
+    out = []
+    if SIM is not None:
+        # compute network baseline from SIM if available
+        try:
+            baseline_speed = getattr(SIM, '_cv_history') and (sum([s['average_speed_kmh'] for s in list(SIM._cv_history)[-SIM.cv_baseline_window:]]) / max(1, len(list(SIM._cv_history)[-SIM.cv_baseline_window:]))) or None
+        except Exception:
+            baseline_speed = None
+        for inc in SIM.incidents.values():
+            s = inc.summary()
+            # per-incident observability: speed drop vs baseline and volume change if baseline known
+            try:
+                u, v, k = inc.edge
+                edge_data = SIM.G[u][v][k]
+                current_speed = edge_data.get('current_speed_kmh', edge_data.get('free_flow_speed_kmh', None))
+                if baseline_speed and baseline_speed > 0 and current_speed is not None:
+                    speed_drop_ratio = max(0.0, min(1.0, (baseline_speed - current_speed) / baseline_speed))
+                else:
+                    speed_drop_ratio = None
+                s['speed_drop_ratio'] = speed_drop_ratio
+            except Exception:
+                s['speed_drop_ratio'] = None
+            s['persistence_count'] = getattr(SIM, '_cv_persistent_count', 0)
+            s['incident_confirmed'] = inc.detected_at is not None
+            out.append(s)
+    return jsonify({"incidents": out})
+
+
+@app.route('/api/cv/metrics')
+def api_cv_metrics():
+    try:
+        if DEFAULT_CV is None:
+            return jsonify({'error': 'cv unavailable', 'metrics': None})
+        return jsonify({'metrics': DEFAULT_CV.get_metrics(), 'mode': DEFAULT_CV.mode})
+    except Exception as e:
+        return jsonify({'error': str(e), 'metrics': None}), 500
 
 
 @app.route("/api/simulate/emergency", methods=["POST"])

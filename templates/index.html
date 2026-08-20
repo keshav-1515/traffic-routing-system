@@ -514,6 +514,39 @@
       <div class="stat-row"><span class="k">Roads under override</span><span class="v" id="sim-overrides">–</span></div>
       <div class="stat-row"><span class="k">Peak-hour surge</span><span class="v" id="sim-surge">–</span></div>
       <div class="stat-row"><span class="k">CO₂ emitted</span><span class="v" id="sim-co2">–</span></div>
+      <div style="margin-top:10px;display:flex;gap:8px;">
+        <button id="btn-trigger-incident" class="primary-btn" style="flex:1;">Trigger Demo Incident</button>
+        <button id="btn-clear-incident" class="primary-btn" style="flex:1;background:#e5e7f0;color:var(--text);">Clear Demo Incident</button>
+      </div>
+    </div>
+
+    <div class="card" id="cv-card">
+      <div class="section-label">Vehicle detection</div>
+      <div class="stat-row"><span class="k">Cars</span><span class="v" id="cv-cars">–</span></div>
+      <div class="stat-row"><span class="k">Motorcycles</span><span class="v" id="cv-motos">–</span></div>
+      <div class="stat-row"><span class="k">Buses</span><span class="v" id="cv-buses">–</span></div>
+      <div class="stat-row"><span class="k">Trucks</span><span class="v" id="cv-trucks">–</span></div>
+      <div class="stat-row"><span class="k">Total</span><span class="v" id="cv-total">–</span></div>
+      <div class="stat-row"><span class="k">Average speed</span><span class="v" id="cv-avg-speed">–</span></div>
+      <div class="stat-row"><span class="k">Active tracked</span><span class="v" id="cv-active-tracks">–</span></div>
+      <div style="margin-top:8px"><button id="cv-toggle-mock" class="primary-btn" style="width:100%">Use mock CV</button></div>
+    </div>
+
+    <div class="card" id="incident-card">
+      <div class="section-label">Active Incident</div>
+      <div id="incident-info" class="empty-note">No active incident</div>
+      <div id="incident-observability" style="margin-top:8px;font-size:13px;color:var(--text-faint)"></div>
+    </div>
+
+    <div class="card" id="routing-card">
+      <div class="section-label">Routing</div>
+      <div class="stat-row"><span class="k">Original ETA</span><span class="v" id="route-original-eta">N/A</span></div>
+      <div class="stat-row"><span class="k">Recommended ETA</span><span class="v" id="route-recommended-eta">N/A</span></div>
+      <div class="stat-row"><span class="k">Time saved</span><span class="v" id="route-time-saved">N/A</span></div>
+      <div class="stat-row"><span class="k">Rerouting</span><span class="v" id="route-rerouting-status">N/A</span></div>
+      <div class="stat-row"><span class="k">Reroute reason</span><span class="v" id="route-rerouting-reason">N/A</span></div>
+      <div class="stat-row"><span class="k">CO₂ saved (ESTIMATED)</span><span class="v" id="route-co2-saved">N/A</span></div>
+      <div style="margin-top:8px;display:flex;gap:8px;"><button id="route-demo-refresh" class="primary-btn" style="flex:1;">Refresh Demo Route</button></div>
     </div>
 
     <div class="card">
@@ -708,6 +741,140 @@
       peakHourActive = r.peak_hour_active;
       updatePeakUI();
       toast('Peak hour ' + (peakHourActive ? 'enabled — zone roads penalized harder' : 'disabled'));
+    });
+  });
+
+  // Demo incident buttons
+  document.getElementById('btn-trigger-incident').addEventListener('click', () => {
+    postJSON('/api/demo/scenario', { action: 'trigger' }).then(r => {
+      if (r && r.incident) {
+        toast('Demo incident triggered');
+        // store demo src/dst if provided for routing observability
+        if (r.demo_src && r.demo_dst) {
+          window._demo_src = r.demo_src;
+          window._demo_dst = r.demo_dst;
+          refreshDemoRouteUI();
+        }
+      } else {
+        toast('Failed to trigger incident');
+      }
+      // refresh state to show incident
+      refreshSimState();
+      refreshIncidentsUI();
+    }).catch(() => { toast('Trigger failed'); });
+  });
+  document.getElementById('btn-clear-incident').addEventListener('click', () => {
+    postJSON('/api/demo/scenario', { action: 'clear' }).then(r => {
+      toast('Demo incidents cleared');
+      window._demo_src = null; window._demo_dst = null;
+      clearDemoRouteUI();
+      refreshSimState();
+      refreshIncidentsUI();
+    }).catch(() => { toast('Clear failed'); });
+  });
+
+  // Normal Traffic button (reset demo state)
+  const normalBtn = document.createElement('button');
+  normalBtn.className = 'primary-btn'; normalBtn.style.width = '100%'; normalBtn.textContent = 'Normal Traffic';
+  normalBtn.addEventListener('click', () => {
+    postJSON('/api/scenario/reset', {}).then(r => { toast('Demo reset'); refreshSimState(); refreshIncidentsUI(); clearDemoRouteUI(); }).catch(() => toast('Reset failed'));
+  });
+  document.querySelector('#cv-card').appendChild(normalBtn);
+
+  function refreshIncidentsUI() {
+    fetch('/api/simulate/state').then(res => res.json()).then(data => {
+      const card = document.getElementById('incident-info');
+      const obs = document.getElementById('incident-observability');
+      const incs = data && data.edges ? Object.values(data.edges).filter(e => e.incident) : [];
+      if (!incs || incs.length === 0) {
+        card.className = 'empty-note';
+        card.textContent = 'No active incident';
+        obs.textContent = '';
+        return;
+      }
+      // pick the first incident edge for display
+      const firstKey = Object.keys(data.edges).find(k => data.edges[k].incident);
+      const parts = firstKey.split('-');
+      const edgeState = data.edges[firstKey];
+      card.className = '';
+      card.innerHTML = `
+        <div><strong>Incident on ${parts.join('-')}</strong></div>
+        <div>Severity: ${edgeState.incident ? (edgeState.capacity_factor < 1 ? 'High' : 'Medium') : 'N/A'}</div>
+        <div>Confidence: ${edgeState.incident ? (edgeState.congestion_score || 'N/A') : 'N/A'}</div>
+      `;
+      // observability from top-level CV fields
+      const baseline = data.cv_baseline_speed_kmh != null ? data.cv_baseline_speed_kmh : 'N/A';
+      const current = data.cv_current_speed_kmh != null ? data.cv_current_speed_kmh : 'N/A';
+      let speedDrop = 'N/A';
+      if (baseline !== 'N/A' && current !== 'N/A') {
+        speedDrop = Math.round(Math.max(0, Math.min(1, (baseline - current) / baseline)) * 100) + '%';
+      }
+      const baselineVol = data.cv_baseline_volume != null ? data.cv_baseline_volume : 'N/A';
+      const currentVol = data.cv_current_volume != null ? data.cv_current_volume : 'N/A';
+      let volChange = 'N/A';
+      if (baselineVol !== 'N/A' && currentVol !== 'N/A' && baselineVol > 0) {
+        volChange = Math.round(((currentVol - baselineVol) / baselineVol) * 100) + '%';
+      }
+      obs.innerHTML = `Baseline speed: ${baseline} km/h · Current: ${current} km/h · Speed drop: ${speedDrop}<br>Baseline vol: ${baselineVol} · Current: ${currentVol} · Vol change: ${volChange}<br>Persistence: ${data.cv_persistence_count}`;
+    }).catch(() => {});
+  }
+
+  // poll incidents every few seconds
+  setInterval(refreshIncidentsUI, 3000);
+  refreshIncidentsUI();
+
+  // CV metrics poll
+  function refreshCvMetrics() {
+    fetch('/api/cv/metrics').then(r => r.json()).then(data => {
+      const m = data && data.metrics ? data.metrics : null;
+      if (!m) return;
+      document.getElementById('cv-cars').textContent = m.cars;
+      document.getElementById('cv-motos').textContent = m.motorcycles;
+      document.getElementById('cv-buses').textContent = m.buses;
+      document.getElementById('cv-trucks').textContent = m.trucks;
+      document.getElementById('cv-total').textContent = m.total_vehicles;
+      document.getElementById('cv-avg-speed').textContent = m.average_speed_kmh ? `${m.average_speed_kmh} km/h` : 'N/A';
+      document.getElementById('cv-active-tracks').textContent = m.active_vehicle_count != null ? m.active_vehicle_count : 'N/A';
+    }).catch(() => {});
+  }
+  setInterval(refreshCvMetrics, 1000);
+  refreshCvMetrics();
+
+  // Demo route UI: refresh route observability when demo src/dst available
+  function refreshDemoRouteUI() {
+    if (!window._demo_src || !window._demo_dst) return;
+    fetch(`/api/route?source=${window._demo_src}&target=${window._demo_dst}&by=time`).then(r => r.json()).then(data => {
+      if (data.error) return;
+      document.getElementById('route-original-eta').textContent = data.time_min != null ? `${data.time_min} min` : 'N/A';
+      document.getElementById('route-recommended-eta').textContent = data.recommended && data.recommended_route ? `${data.recommended_route.time_min} min` : (data.baseline_eta_min != null ? `${data.baseline_eta_min} min` : 'N/A');
+      document.getElementById('route-time-saved').textContent = data.time_saved_min != null ? `${data.time_saved_min} min` : 'N/A';
+      document.getElementById('route-rerouting-status').textContent = data.recommended ? 'Yes' : 'No';
+      document.getElementById('route-rerouting-reason').textContent = data.rerouting_reason || 'N/A';
+      document.getElementById('route-co2-saved').textContent = data.co2_saved_g != null ? `${data.co2_saved_g} g` : 'N/A';
+      // draw recommended route if provided
+      if (data.recommended && data.recommended.geometry) {
+        if (window._demo_recommended_layer) map.removeLayer(window._demo_recommended_layer);
+        const latlngs = data.recommended.geometry.coordinates.map(([lng, lat]) => [lat, lng]);
+        window._demo_recommended_layer = L.polyline(latlngs, { color: '#ff8800', weight: 6, opacity: 0.9, dashArray: '8 6' }).addTo(map);
+      }
+    }).catch(() => {});
+  }
+
+  function clearDemoRouteUI() {
+    document.getElementById('route-original-eta').textContent = 'N/A';
+    document.getElementById('route-recommended-eta').textContent = 'N/A';
+    document.getElementById('route-time-saved').textContent = 'N/A';
+    document.getElementById('route-rerouting-status').textContent = 'N/A';
+    document.getElementById('route-rerouting-reason').textContent = 'N/A';
+    document.getElementById('route-co2-saved').textContent = 'N/A';
+    if (window._demo_recommended_layer) { map.removeLayer(window._demo_recommended_layer); window._demo_recommended_layer = null; }
+  }
+
+  document.getElementById('route-demo-refresh').addEventListener('click', () => refreshDemoRouteUI());
+
+  document.getElementById('cv-toggle-mock').addEventListener('click', () => {
+    fetch('/api/cv/metrics').then(r => r.json()).then(data => {
+      toast('CV mode: ' + (data.mode || 'unknown'));
     });
   });
 
@@ -1348,13 +1515,18 @@
     if (!driveStartNode || !driveEndNode) return;
     driveStartBtn.disabled = true;
     driveStartBtn.textContent = 'Routing…';
+    // Add a timeout/abort so the UI never stays stuck if the request never settles
+    const controller = new AbortController();
+    // allow more time for routing to compute on the server before aborting
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
     fetch('/api/drive/start', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ source: driveStartNode, target: driveEndNode }),
+      signal: controller.signal,
     })
       .then(res => res.json())
       .then(state => {
-        driveStartBtn.textContent = '▶ Start Drive';
+        clearTimeout(timeoutId);
         if (state.error) {
           driveInfoEl.innerHTML = `<span>${state.error}</span>`;
           driveStartBtn.disabled = false;
@@ -1371,7 +1543,8 @@
         if (!driveAnimHandle) driveAnimHandle = requestAnimationFrame(driveAnimTick);
         drivePollTimer = setInterval(pollDriveState, 1000);
       })
-      .catch(() => {
+      .catch((err) => {
+        clearTimeout(timeoutId);
         driveStartBtn.textContent = '▶ Start Drive';
         driveStartBtn.disabled = false;
       });
@@ -1418,8 +1591,9 @@
     if (!layer) return;
     layer.setStyle({
       color: state.closed ? '#9aa1b8' : congestionColor(Math.min(state.congestion_score, 1)),
-      opacity: state.closed ? 0.5 : 0.85,
+      opacity: state.closed ? 0.5 : 0.95,
       dashArray: state.closed ? '2 6' : (state.incident ? '6 4' : null),
+      weight: state.incident ? 7 : 4,
     });
   }
 

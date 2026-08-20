@@ -457,6 +457,34 @@ class EdgeOverride:
                 and self.zone_type is None and self.manual_congestion_score is None)
 
 
+@dataclass
+class Incident:
+    incident_id: str
+    edge: EdgeKey
+    incident_type: str
+    severity: float
+    confidence: float
+    detected_at: Optional[float]
+    active: bool
+    blocked_fraction: float
+    created_at: float
+    original_capacity: float = 1.0
+    original_manual_congestion: Optional[float] = None
+    original_weight: Optional[float] = None
+
+    def summary(self) -> Dict:
+        return {
+            "incident_id": self.incident_id,
+            "edge": list(map(str, self.edge)),
+            "incident_type": self.incident_type,
+            "severity": round(self.severity, 3),
+            "confidence": round(self.confidence, 3),
+            "detected_at": round(self.detected_at, 3) if self.detected_at is not None else None,
+            "active": self.active,
+            "blocked_fraction": round(self.blocked_fraction, 3),
+        }
+
+
 ZONE_WEIGHT_MULTIPLIER = {"hospital": 1.7, "school": 1.7, "emergency": 8.0}
 
 # Extra multiplier stacked on top of ZONE_WEIGHT_MULTIPLIER while a
@@ -627,6 +655,29 @@ class TrafficSimulation:
         self._thread: Optional[threading.Thread] = None
         self._running = False
 
+        # incident bookkeeping
+        self.incidents: Dict[str, Incident] = {}
+        self._next_incident_id = 1
+        self.last_reroute_times: Dict[Tuple[object, object], float] = {}
+        # external CV metrics can be set by the CV engine
+        self.external_cv_metrics = None
+        # CV-driven detection bookkeeping
+        self._cv_history: deque = deque(maxlen=60)  # recent CV observations (configurable)
+        self.cv_baseline_window = 20  # number of recent samples to compute baseline
+        self.cv_persistence_required = 3  # observations required to consider persistent
+        self._cv_persistent_count = 0
+        self.cv_speed_drop_threshold = 0.12
+        self.cv_volume_increase_threshold = 0.20
+        self.cv_cooldown_min = 1.0  # minutes of sim-time cooldown per edge
+        self._last_cv_incident_min: Dict[EdgeKey, float] = {}
+        # weights and thresholds
+        self.cv_sim_weight = 0.6
+        self.cv_signal_weight = 0.8
+        self.cv_cross_validation_boost = 0.15
+        self.incident_trigger_confidence = 0.45
+        # severity thresholds
+        self.severity_thresholds = {'low': 0.35, 'medium': 0.6, 'high': 0.85}
+
         self._init_edge_fd_cache()
 
     # -- fundamental-diagram parameters are static per edge, cache them ----
@@ -672,6 +723,11 @@ class TrafficSimulation:
             self._advance_drive()
             self._update_signals()
             self._update_edge_states()
+            # update incident confidence / detection after edge states updated
+            try:
+                self._detect_incidents()
+            except Exception:
+                pass
 
     # ---- demand & routing -------------------------------------------------
     def _spawn_vehicles(self):
@@ -910,6 +966,212 @@ class TrafficSimulation:
         with self._lock:
             self.edge_overrides.pop(edge, None)
             self._apply_override_now(edge)
+
+    # ---- INCIDENTS: create / clear / detect -----------------------------
+    def trigger_incident(self, edge: EdgeKey, incident_type: str = "stalled_vehicle",
+                         severity: float = 0.9, confidence: float = 0.2, blocked_fraction: float = 1.0) -> Incident:
+        """Deterministically create an incident on an edge and apply temporary overrides."""
+        with self._lock:
+            inc_id = f"inc-{self._next_incident_id}"
+            self._next_incident_id += 1
+            now = self.sim_clock_min
+            u, v, k = edge
+            data = self.G[u][v][k]
+            # save originals
+            orig_cap = data.get("capacity_veh_per_hr", 1800.0)
+            orig_manual = data.get("manual_congestion_score") if data.get("manual_congestion_score", None) is not None else None
+            orig_weight = data.get("weight", None)
+            orig_speed = data.get("current_speed_kmh", data.get("free_flow_speed_kmh", 30.0))
+
+            incident = Incident(
+                incident_id=inc_id,
+                edge=edge,
+                incident_type=incident_type,
+                severity=max(0.0, min(1.0, severity)),
+                confidence=max(0.0, min(1.0, confidence)),
+                detected_at=None,
+                active=True,
+                blocked_fraction=max(0.0, min(1.0, blocked_fraction)),
+                created_at=now,
+                original_capacity=orig_cap,
+                original_manual_congestion=orig_manual,
+                original_weight=orig_weight,
+                # store original speed so CO2 estimates can use pre-incident values
+                # (attach as attribute on the dataclass)
+            )
+            # attach original speed separately (dataclass field wasn't present)
+            incident.original_speed_kmh = orig_speed
+            
+
+            # apply an override: reduce capacity and force a high congestion score
+            ov = self._get_or_create_override(edge)
+            ov.capacity_factor = max(0.05, 1.0 - incident.blocked_fraction)
+            ov.manual_congestion_score = incident.severity
+            ov.label = f"incident:{incident.incident_type}"
+            # keep incident recorded
+            self.incidents[inc_id] = incident
+            # write incident info into edge data for immediate visibility
+            data["incident_info"] = incident.summary()
+            data["incident"] = True
+            self._apply_override_now(edge)
+            return incident
+
+    def clear_incident(self, incident_id: str) -> bool:
+        with self._lock:
+            inc = self.incidents.get(incident_id)
+            if not inc:
+                return False
+            edge = inc.edge
+            u, v, k = edge
+            data = self.G[u][v][k]
+            # restore original values
+            ov = self.edge_overrides.get(edge)
+            if ov:
+                ov.capacity_factor = 1.0
+                ov.manual_congestion_score = None
+                ov.label = ""
+                if ov.is_default():
+                    del self.edge_overrides[edge]
+            data.pop("incident_info", None)
+            data["incident"] = False
+            inc.active = False
+            self._apply_override_now(edge)
+            del self.incidents[incident_id]
+            return True
+
+    def clear_all_incidents(self) -> int:
+        with self._lock:
+            ids = list(self.incidents.keys())
+            for iid in ids:
+                self.clear_incident(iid)
+            return len(ids)
+
+    def _detect_incidents(self):
+        """Lightweight incident confidence updater using current edge stats."""
+        now = self.sim_clock_min
+        # compute CV baseline and current anomaly state
+        cv = getattr(self, 'external_cv_metrics', None)
+        baseline_speed = None
+        baseline_volume = None
+        current_speed = None
+        current_volume = None
+        cv_anomaly = False
+        if len(self._cv_history) >= 1:
+            # baseline: mean of last N samples (excluding the most recent few to avoid contamination)
+            window = list(self._cv_history)[-self.cv_baseline_window:]
+            speeds = [s['average_speed_kmh'] for s in window if s.get('average_speed_kmh') is not None]
+            vols = [s['total_vehicles'] for s in window if s.get('total_vehicles') is not None]
+            if speeds:
+                baseline_speed = sum(speeds) / len(speeds)
+            if vols:
+                baseline_volume = sum(vols) / len(vols)
+        if cv and isinstance(cv, dict):
+            current_speed = float(cv.get('average_speed_kmh', 0.0) or 0.0)
+            # prefer total_vehicles if provided else active_vehicle_count
+            current_volume = int(cv.get('total_vehicles', cv.get('active_vehicle_count', 0)) or 0)
+            # compute cv anomaly flags
+            if baseline_speed and baseline_speed > 1.0:
+                speed_drop_ratio = max(0.0, min(1.0, (baseline_speed - current_speed) / baseline_speed))
+            else:
+                speed_drop_ratio = 0.0
+            if baseline_volume and baseline_volume > 0:
+                volume_change = max(-1.0, (current_volume - baseline_volume) / baseline_volume)
+            else:
+                volume_change = 0.0
+            # decide if this sample is abnormal
+            if speed_drop_ratio >= self.cv_speed_drop_threshold or volume_change >= self.cv_volume_increase_threshold:
+                self._cv_persistent_count = min(self._cv_persistent_count + 1, self.cv_baseline_window)
+            else:
+                # decay persistence slowly
+                self._cv_persistent_count = max(0, self._cv_persistent_count - 1)
+            cv_anomaly = self._cv_persistent_count >= self.cv_persistence_required
+        else:
+            speed_drop_ratio = 0.0
+            volume_change = 0.0
+        for iid, inc in list(self.incidents.items()):
+            if not inc.active:
+                continue
+            u, v, k = inc.edge
+            if v not in self.G[u] or k not in self.G[u][v]:
+                continue
+            data = self.G[u][v][k]
+            speed = data.get("current_speed_kmh", data.get("free_flow_speed_kmh", 30.0))
+            free_v = data.get("free_flow_speed_kmh", 30.0)
+            congestion = data.get("congestion_score", 0.0)
+            # simulation-derived signal
+            sim_speed_drop = max(0.0, (1.0 - speed / max(free_v, 1.0)))
+            sim_signal = min(1.0, 0.6 * sim_speed_drop + 0.4 * congestion)
+
+            # If we do not yet have CV baseline/history, keep original behaviour
+            if len(self._cv_history) == 0:
+                conf = min(1.0, inc.confidence + 0.6 * sim_speed_drop + 0.4 * congestion)
+            else:
+                # CV-derived signal (network-level)
+                cv_signal = 0.0
+                if baseline_speed and baseline_speed > 1.0 and current_speed is not None:
+                    cv_signal = speed_drop_ratio * 0.7 + max(0.0, volume_change) * 0.3
+                    cv_signal = min(1.0, cv_signal)
+
+                # combine signals with cross-validation boost when both indicate anomaly
+                combined = (self.cv_sim_weight * sim_signal) + (self.cv_signal_weight * cv_signal)
+                if sim_signal > 0.1 and cv_anomaly:
+                    combined = min(1.0, combined + self.cv_cross_validation_boost)
+
+                # smooth confidence update and apply limited step to avoid oscillation
+                step = min(0.25, combined)
+                conf = min(1.0, inc.confidence + step)
+            inc.confidence = conf
+            if inc.detected_at is None and conf > self.severity_thresholds['low']:
+                inc.detected_at = now
+            inc.confidence = conf
+            # update severity mapping
+            if conf >= self.severity_thresholds['high']:
+                inc.severity = 1.0
+            elif conf >= self.severity_thresholds['medium']:
+                inc.severity = 0.6
+            elif conf >= self.severity_thresholds['low']:
+                inc.severity = 0.3
+            else:
+                inc.severity = 0.0
+            # update edge info for API
+            data["incident_info"] = inc.summary()
+
+        # SCAN for new incidents driven by CV + sim signals
+        # only consider creating incidents if CV anomaly persisted
+        if cv_anomaly:
+            for u, v, k, data in self.G.edges(keys=True, data=True):
+                edge = (u, v, k)
+                # skip if already an active incident
+                if any((inc.edge == edge for inc in self.incidents.values())):
+                    continue
+                speed = data.get("current_speed_kmh", data.get("free_flow_speed_kmh", 30.0))
+                free_v = data.get("free_flow_speed_kmh", 30.0)
+                congestion = data.get("congestion_score", 0.0)
+                sim_speed_drop = max(0.0, (1.0 - speed / max(free_v, 1.0)))
+                sim_signal = min(1.0, 0.6 * sim_speed_drop + 0.4 * congestion)
+                cv_signal = 0.0
+                if baseline_speed and baseline_speed > 1.0 and current_speed is not None:
+                    cv_signal = speed_drop_ratio * 0.7 + max(0.0, volume_change) * 0.3
+                    cv_signal = min(1.0, cv_signal)
+
+                combined = (self.cv_sim_weight * sim_signal) + (self.cv_signal_weight * cv_signal)
+                if sim_signal > 0.15 and cv_anomaly:
+                    combined = min(1.0, combined + self.cv_cross_validation_boost)
+
+                # enforce cooldown per edge
+                last = self._last_cv_incident_min.get(edge, -9999)
+                if self.sim_clock_min - last < self.cv_cooldown_min:
+                    continue
+
+                if combined >= self.incident_trigger_confidence:
+                    # create a new incident; severity derived from combined
+                    sev = 1.0 if combined >= self.severity_thresholds['high'] else (0.6 if combined >= self.severity_thresholds['medium'] else 0.3)
+                    try:
+                        inc = self.trigger_incident(edge, incident_type='cv_detected', severity=sev, confidence=combined, blocked_fraction=min(1.0, combined))
+                        if inc:
+                            self._last_cv_incident_min[edge] = self.sim_clock_min
+                    except Exception:
+                        pass
 
     def simulate_peak_surge(self, edge: Optional[EdgeKey] = None,
                              duration_min: float = 30.0, intensity: float = 2.6):
@@ -1467,7 +1729,30 @@ class TrafficSimulation:
                     }
                     for u, v, k, d in edges
                 },
+                # CV observability (network-level)
+                "cv_baseline_speed_kmh": (sum([s['average_speed_kmh'] for s in list(self._cv_history)[-self.cv_baseline_window:]]) / max(1, len(list(self._cv_history)[-self.cv_baseline_window:]))) if len(self._cv_history) > 0 else None,
+                "cv_current_speed_kmh": (self.external_cv_metrics.get('average_speed_kmh') if self.external_cv_metrics else None),
+                "cv_baseline_volume": (sum([s['total_vehicles'] for s in list(self._cv_history)[-self.cv_baseline_window:]]) / max(1, len(list(self._cv_history)[-self.cv_baseline_window:]))) if len(self._cv_history) > 0 else None,
+                "cv_current_volume": (self.external_cv_metrics.get('total_vehicles') if self.external_cv_metrics else None),
+                "cv_persistence_count": getattr(self, '_cv_persistent_count', 0),
             }
+
+    def set_external_cv_metrics(self, metrics: dict) -> None:
+        """Accept external CV-derived aggregated metrics (speed, counts)."""
+        with self._lock:
+            self.external_cv_metrics = metrics
+            # append to history (store sim-clock aligned sample)
+            try:
+                sample = {
+                    'sim_min': self.sim_clock_min,
+                    'timestamp': metrics.get('timestamp', time.time()),
+                    'average_speed_kmh': float(metrics.get('average_speed_kmh', 0.0) or 0.0),
+                    'total_vehicles': int(metrics.get('total_vehicles', 0) or 0),
+                    'active_vehicle_count': int(metrics.get('active_vehicle_count', 0) or 0),
+                }
+                self._cv_history.append(sample)
+            except Exception:
+                pass
 
 
 # ===========================================================================
