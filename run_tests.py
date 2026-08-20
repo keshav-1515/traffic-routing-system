@@ -35,26 +35,31 @@ try:
 except Exception as e:
     print('Failed to import tests.test_tracker:', e)
     sys.exit(2)
+try:
+    m4 = importlib.import_module('tests.test_graph_mode')
+except Exception as e:
+    print('Failed to import tests.test_graph_mode:', e)
+    sys.exit(2)
 
 failed = False
-for name in dir(m):
-    if name.startswith('test_'):
-        func = getattr(m, name)
-        if callable(func):
-            try:
-                print('RUN:', name)
-                func()
-                print('OK:', name)
-            except AssertionError as ae:
-                print('FAILED:', name, ae)
-                failed = True
-            except Exception as e:
-                print('ERROR:', name, e)
-                failed = True
+for module in (m, m2, m3, m4):
+    for name in dir(module):
+        if name.startswith('test_'):
+            func = getattr(module, name)
+            if callable(func):
+                try:
+                    print('RUN:', module.__name__, name)
+                    func()
+                    print('OK:', module.__name__, name)
+                except AssertionError as ae:
+                    print('FAILED:', module.__name__, name, ae)
+                    failed = True
+                except Exception as e:
+                    print('ERROR:', module.__name__, name, e)
+                    failed = True
 
 if failed:
     print('SOME TESTS FAILED')
     sys.exit(1)
 print('ALL TESTS PASSED')
-sys.exit(0)
 sys.exit(0)

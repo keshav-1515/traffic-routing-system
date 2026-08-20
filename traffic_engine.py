@@ -1684,12 +1684,13 @@ class TrafficSimulation:
             edges = self.G.edges(keys=True, data=True)
             scores = [d.get("congestion_score", 0.0) for *_, d in edges]
             avg_load = (sum(scores) / len(scores)) if scores else 0.0
+            drive_active = self.drive is not None and self.drive.status == "active"
             return {
                 "running": self._running,
                 "sim_clock_min": round(self.sim_clock_min % 1440.0, 1),
                 "sim_day_hhmm": f"{int(self.sim_clock_min % 1440 // 60):02d}:{int(self.sim_clock_min % 60):02d}",
                 "signal_mode": self.signal_mode,
-                "active_vehicles": len(self.vehicles),
+                "active_vehicles": len(self.vehicles) + (1 if drive_active else 0),
                 "trips_completed": self.trips_completed,
                 "avg_travel_time_min": round(
                     self.total_travel_time_min / self.trips_completed, 2

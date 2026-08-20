@@ -1645,10 +1645,10 @@
       document.getElementById('map-chip-edgecount').textContent = data.edge_count;
       const badge = document.getElementById('source-badge');
       if (data.using_synthetic) {
-        badge.textContent = 'Synthetic grid (offline mode)';
+        badge.textContent = 'Synthetic grid • Offline mode';
         badge.classList.add('synthetic');
       } else {
-        badge.textContent = 'Real OpenStreetMap data';
+        badge.textContent = 'OpenStreetMap • Online mode';
         badge.classList.add('real');
       }
 

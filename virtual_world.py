@@ -23,7 +23,9 @@ Run:
 """
 
 import argparse
+import os
 import random
+import re
 import sys
 import tempfile
 import uuid
@@ -96,6 +98,7 @@ ROAD_PROFILES = {
 DEFAULT_PROFILE = {"lanes": 1, "speed_kmh": 30}
 
 CAPACITY_PER_LANE_PER_HOUR = 1800  # standard traffic-engineering rule of thumb (veh/hr/lane)
+DEFAULT_ONLINE_PLACE = "Koramangala, Bangalore, India"
 
 # BPR (Bureau of Public Roads) congestion penalty constants — the standard
 # formula traffic engineers use to turn a congestion ratio into a travel-time
@@ -124,13 +127,22 @@ def enrich_edge(data):
     except (ValueError, TypeError):
         lanes = profile["lanes"]
 
-    length_m = data.get("length", 50.0)
-    speed_kmh = profile["speed_kmh"]
+    length_m = float(data.get("length", 50.0) or 50.0)
+    speed_kmh = float(data.get("speed_kmh", profile["speed_kmh"]))
+
+    data.setdefault("incident", False)
+    data.setdefault("incident_info", None)
+    data.setdefault("override_state", None)
+    data.setdefault("override_label", None)
+    data.setdefault("travel_time_min", None)
 
     data["lanes"] = lanes
+    data["length"] = length_m
+    data["speed_kmh"] = speed_kmh
     data["free_flow_speed_kmh"] = speed_kmh
     data["capacity_veh_per_hr"] = lanes * CAPACITY_PER_LANE_PER_HOUR
-    data["free_flow_time_min"] = round((length_m / 1000) / speed_kmh * 60, 3)
+    data["free_flow_time_min"] = round((length_m / 1000) / max(speed_kmh, 1.0) * 60, 3)
+    data["travel_time_min"] = data["free_flow_time_min"]
 
     # current_volume will be populated later by a real traffic simulation
     # module. For now it seeds a congestion_score so the graph is routable
@@ -138,6 +150,8 @@ def enrich_edge(data):
     data["current_volume"] = 0
     if "congestion_score" not in data:
         data["congestion_score"] = round(random.uniform(0.05, 0.95), 2)
+    data.setdefault("current_speed_kmh", speed_kmh)
+    data.setdefault("zone_type", None)
 
     recompute_weight(data)
     return data
@@ -378,43 +392,237 @@ def analyze_traffic_video(file_storage):
 # ---------------------------------------------------------------------------
 # 2. Build the graph — real data via OSMnx, or a synthetic grid fallback
 # ---------------------------------------------------------------------------
-def build_graph_from_place(place_name, dist=1500):
-    import osmnx as ox
-
-    print(f"[graph] Downloading road network for: {place_name}")
+def _configure_osmnx_cache(base_dir=None):
     try:
-        # Works when Nominatim has a clean administrative POLYGON for the
-        # place (cities, wards, official boundaries). Many neighbourhoods
-        # (e.g. "Koramangala") only geocode to a POINT, so this raises.
-        G = ox.graph_from_place(place_name, network_type="drive", simplify=True)
-    except Exception as e:
-        print(f"[graph] graph_from_place failed ({e}); "
-              f"retrying as a point + {dist}m radius instead", file=sys.stderr)
-        # Geocodes the place name to a single point via Nominatim, then
-        # pulls every road within `dist` metres of it. This is the reliable
-        # method for neighbourhoods/localities that lack a polygon boundary.
-        G = ox.graph_from_address(place_name, dist=dist,
-                                   network_type="drive", simplify=True)
+        import osmnx as ox
+    except Exception:
+        return None
+    try:
+        cache_dir = base_dir or __file__
+        if cache_dir == __file__:
+            cache_dir = __file__.rsplit(".", 1)[0] if "." in __file__ else __file__
+        cache_dir = cache_dir if not str(cache_dir).endswith("osmnx") else cache_dir
+        if cache_dir and not str(cache_dir).endswith("osmnx"):
+            cache_dir = str(cache_dir).rstrip("\\/") + "\\osmnx"
+        os.makedirs(cache_dir, exist_ok=True)
+        if hasattr(ox, "settings"):
+            ox.settings.use_cache = True
+            try:
+                ox.settings.cache_folder = cache_dir
+            except Exception:
+                pass
+        if hasattr(ox, "config"):
+            try:
+                ox.config(use_cache=True, cache_folder=cache_dir)
+            except Exception:
+                pass
+        return cache_dir
+    except Exception:
+        return None
+
+
+def prepare_graph_for_routing(G, source_name="OSM"):
+    """Normalise any road graph into the app's expected MultiDiGraph layout."""
+    if G is None:
+        raise ValueError("road graph is None")
+    if not isinstance(G, nx.MultiDiGraph):
+        G = nx.MultiDiGraph(G)
+
+    G.graph.setdefault("crs", "epsg:4326")
+    G.graph.setdefault("source", source_name)
+
+    for node, data in G.nodes(data=True):
+        if "x" not in data and "lon" in data:
+            data["x"] = data["lon"]
+        if "y" not in data and "lat" in data:
+            data["y"] = data["lat"]
+        if "geometry" in data and hasattr(data["geometry"], "coords"):
+            coords = list(data["geometry"].coords)
+            if coords:
+                data.setdefault("x", coords[0][0])
+                data.setdefault("y", coords[0][1])
+        if "x" not in data or "y" not in data:
+            raise ValueError(f"node {node} is missing x/y coordinates")
 
     for _, _, _, data in G.edges(keys=True, data=True):
+        if "geometry" in data and hasattr(data["geometry"], "coords"):
+            coords = list(data["geometry"].coords)
+            if len(coords) >= 2:
+                data.setdefault("length", 0.0)
+        data.setdefault("incident", False)
+        data.setdefault("incident_info", None)
+        data.setdefault("override_state", None)
+        data.setdefault("zone_type", None)
         enrich_edge(data)
+
     return G
+
+
+DEFAULT_OSM_GRAPH_CACHE = os.path.join(os.path.dirname(__file__), "cache", "osmnx", "koramangala_osm.graphml")
+OSM_OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://lz4.overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+]
+
+
+def _osmnx_graph_cache_path(cache_dir=None, label=None):
+    if cache_dir is None:
+        cache_dir = os.path.dirname(DEFAULT_OSM_GRAPH_CACHE)
+    if label is None:
+        return DEFAULT_OSM_GRAPH_CACHE
+    safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", str(label)).strip("._") or "osm_graph"
+    return os.path.join(cache_dir, f"{safe_label}.graphml")
+
+
+def _configure_osmnx_overpass(cache_dir=None):
+    try:
+        import osmnx as ox
+    except Exception:
+        return
+    cache_dir = cache_dir or os.path.dirname(DEFAULT_OSM_GRAPH_CACHE)
+    os.makedirs(cache_dir, exist_ok=True)
+    ox.settings.use_cache = True
+    ox.settings.cache_folder = cache_dir
+    ox.settings.use_public_overpass = True
+    ox.settings.timeout = 180
+    ox.settings.nominatim_endpoint = "https://nominatim.openstreetmap.org/"
+    try:
+        ox.config(
+            use_cache=True,
+            cache_folder=cache_dir,
+            use_public_overpass=True,
+            timeout=180,
+            nominatim_endpoint="https://nominatim.openstreetmap.org/",
+        )
+    except Exception:
+        pass
+
+
+def _load_cached_osm_graph(cache_path=None):
+    cache_path = cache_path or DEFAULT_OSM_GRAPH_CACHE
+    try:
+        import osmnx as ox
+    except Exception:
+        ox = None
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        if ox is not None:
+            G = ox.load_graphml(cache_path)
+        else:
+            G = nx.read_graphml(cache_path)
+            for _, data in G.nodes(data=True):
+                for coordinate in ("x", "y"):
+                    if coordinate in data:
+                        data[coordinate] = float(data[coordinate])
+        if G is None or G.number_of_nodes() == 0:
+            raise ValueError("cached GraphML is empty")
+        G.graph.setdefault("source", "OSM")
+        return prepare_graph_for_routing(G, source_name="OSM")
+    except Exception as exc:
+        print(f"[graph] Cached OSM GraphML failed to load at {cache_path}: {exc}", file=sys.stderr)
+        try:
+            os.remove(cache_path)
+        except Exception:
+            pass
+        return None
+
+
+def _save_cached_osm_graph(G, cache_path=None):
+    try:
+        import osmnx as ox
+    except Exception:
+        return None
+    cache_path = cache_path or DEFAULT_OSM_GRAPH_CACHE
+    try:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        G = prepare_graph_for_routing(G, source_name="OSM")
+        ox.save_graphml(G, filepath=cache_path)
+        reloaded = _load_cached_osm_graph(cache_path)
+        if reloaded is None:
+            raise ValueError(f"saved GraphML did not reload as a valid graph: {cache_path}")
+        return cache_path
+    except Exception as exc:
+        print(f"[graph] Failed to save cached OSM graph to {cache_path}: {exc}", file=sys.stderr)
+        return None
+
+
+def _download_road_graph(place_name, dist=1500):
+    import osmnx as ox
+    cache_dir = os.path.dirname(DEFAULT_OSM_GRAPH_CACHE)
+    _configure_osmnx_overpass(cache_dir)
+
+    last_error = None
+    for endpoint in OSM_OVERPASS_ENDPOINTS:
+        try:
+            ox.settings.overpass_endpoint = endpoint
+            try:
+                ox.config(overpass_endpoint=endpoint, timeout=180, use_cache=True, cache_folder=cache_dir)
+            except Exception:
+                pass
+            try:
+                G = ox.graph_from_place(place_name, network_type="drive", simplify=True)
+            except Exception as e:
+                print(f"[graph] graph_from_place failed for {endpoint} ({e}); retrying via point-radius fallback", file=sys.stderr)
+                G = ox.graph_from_address(place_name, dist=dist, network_type="drive", simplify=True)
+            if G is None or G.number_of_nodes() == 0:
+                raise ValueError(f"graph_from_place/address returned an empty graph for {endpoint}")
+            return prepare_graph_for_routing(G, source_name="OSM")
+        except Exception as exc:
+            last_error = exc
+            print(f"[graph] OSM endpoint {endpoint} failed: {exc}", file=sys.stderr)
+
+    raise RuntimeError(f"All configured Overpass endpoints failed for {place_name}: {last_error}")
+
+
+def build_graph_from_place(place_name, dist=1500):
+    cache_path = DEFAULT_OSM_GRAPH_CACHE
+    cached = _load_cached_osm_graph(cache_path)
+    if cached is not None:
+        print(f"[graph] Loaded cached OSM graph from {cache_path} for: {place_name}")
+        return cached
+
+    print(f"[graph] Cache miss for {cache_path}; downloading road network for: {place_name}")
+    G = _download_road_graph(place_name, dist=dist)
+    saved_path = _save_cached_osm_graph(G, cache_path)
+    if saved_path is None:
+        return G
+    return _load_cached_osm_graph(saved_path) or G
 
 
 def build_graph_from_bbox(north, south, east, west):
     import osmnx as ox
-    print(f"[graph] Downloading road network for bbox N{north} S{south} E{east} W{west}")
-    try:
-        # OSMnx >= 2.0 API: single bbox tuple (west, south, east, north)
-        G = ox.graph_from_bbox(bbox=(west, south, east, north),
-                                network_type="drive", simplify=True)
-    except TypeError:
-        # OSMnx < 2.0 API: separate north/south/east/west kwargs
-        G = ox.graph_from_bbox(north, south, east, west,
-                                network_type="drive", simplify=True)
-    for _, _, _, data in G.edges(keys=True, data=True):
-        enrich_edge(data)
-    return G
+    cache_path = os.path.join(os.path.dirname(__file__), "cache", "osmnx", "bbox_osm.graphml")
+    cached = _load_cached_osm_graph(cache_path)
+    if cached is not None:
+        print(f"[graph] Loaded cached OSM graph for bbox N{north} S{south} E{east} W{west} from {cache_path}")
+        return cached
+
+    print(f"[graph] Downloading road network for bbox N{north} S{south} E{east} W{west} (cache: {cache_path})")
+    cache_dir = os.path.dirname(cache_path)
+    _configure_osmnx_overpass(cache_dir)
+    last_error = None
+    for endpoint in OSM_OVERPASS_ENDPOINTS:
+        try:
+            ox.settings.overpass_endpoint = endpoint
+            try:
+                ox.config(overpass_endpoint=endpoint, timeout=180, use_cache=True, cache_folder=cache_dir)
+            except Exception:
+                pass
+            try:
+                G = ox.graph_from_bbox(bbox=(west, south, east, north), network_type="drive", simplify=True)
+            except TypeError:
+                G = ox.graph_from_bbox(north, south, east, west, network_type="drive", simplify=True)
+            G = prepare_graph_for_routing(G, source_name="OSM")
+            saved = _save_cached_osm_graph(G, cache_path)
+            if saved is not None:
+                return _load_cached_osm_graph(saved) or G
+            return G
+        except Exception as exc:
+            last_error = exc
+            print(f"[graph] Bounding-box OSM endpoint {endpoint} failed: {exc}", file=sys.stderr)
+    raise RuntimeError(f"All configured Overpass endpoints failed for bbox N{north} S{south} E{east} W{west}: {last_error}")
 
 
 def build_synthetic_grid(rows=8, cols=8, spacing_m=120, origin_lat=12.9716, origin_lng=77.5946):
@@ -461,6 +669,8 @@ def build_synthetic_grid(rows=8, cols=8, spacing_m=120, origin_lat=12.9716, orig
 def init_graph(place=None, bbox=None, dist=1500, signal_mode="adaptive",
                 tick_seconds=2.0, sim_minutes_per_tick=1.0, autostart=True):
     global ROAD_GRAPH, USING_SYNTHETIC, SIM
+    if not place and not bbox:
+        place = DEFAULT_ONLINE_PLACE
     try:
         if place:
             ROAD_GRAPH = build_graph_from_place(place, dist=dist)
@@ -469,11 +679,14 @@ def init_graph(place=None, bbox=None, dist=1500, signal_mode="adaptive",
             ROAD_GRAPH = build_graph_from_bbox(north, south, east, west)
         else:
             raise RuntimeError("No place/bbox given, using synthetic grid.")
+        ROAD_GRAPH = prepare_graph_for_routing(ROAD_GRAPH, source_name="OSM")
         USING_SYNTHETIC = False
+        ROAD_GRAPH.graph["source"] = "OSM"
     except Exception as e:
         print(f"[graph] Falling back to synthetic grid. Reason: {e}", file=sys.stderr)
         ROAD_GRAPH = build_synthetic_grid()
         USING_SYNTHETIC = True
+        ROAD_GRAPH.graph["source"] = "synthetic"
         # synthetic grid already seeds congestion per-edge in enrich_edge,
         # but real-graph edges need it too:
     if not USING_SYNTHETIC:
@@ -576,13 +789,7 @@ def graph_to_geojson(G):
         })
 
     edge_features = []
-    seen = set()  # dedupe A->B / B->A pairs so the map isn't drawn twice
     for u, v, k, data in G.edges(keys=True, data=True):
-        pair_key = tuple(sorted((u, v)))
-        if pair_key in seen:
-            continue
-        seen.add(pair_key)
-
         if "geometry" in data and hasattr(data["geometry"], "coords"):
             coords = [[x, y] for x, y in data["geometry"].coords]
         else:
@@ -633,6 +840,8 @@ def api_graph():
     geojson = graph_to_geojson(ROAD_GRAPH)
     return jsonify({
         "using_synthetic": USING_SYNTHETIC,
+        "graph_source": "synthetic" if USING_SYNTHETIC else "OSM",
+        "graph_mode": "Offline mode" if USING_SYNTHETIC else "Online mode",
         "node_count": ROAD_GRAPH.number_of_nodes(),
         "edge_count": len(geojson["edges"]["features"]),
         **geojson,
@@ -1043,6 +1252,8 @@ def api_drive_start():
     if source not in ROAD_GRAPH or target not in ROAD_GRAPH:
         return jsonify({"error": "unknown source/target node id"}), 404
 
+    if not SIM.running:
+        SIM.start()
     state = SIM.start_drive(source, target)
     if not state.get("active") and state.get("status") not in ("arrived",):
         return jsonify({"error": "no route currently exists between these nodes"}), 404
@@ -1246,7 +1457,7 @@ def api_demo_sim_reset():
 # ---------------------------------------------------------------------------
 def parse_args():
     parser = argparse.ArgumentParser(description="City road-network graph viewer")
-    parser.add_argument("--place", type=str, default=None,
+    parser.add_argument("--place", type=str, default=DEFAULT_ONLINE_PLACE,
                          help='e.g. --place "Koramangala, Bangalore, India"')
     parser.add_argument("--bbox", type=float, nargs=4, default=None,
                          metavar=("NORTH", "SOUTH", "EAST", "WEST"),
