@@ -707,6 +707,10 @@ def init_graph(place=None, bbox=None, dist=1500, signal_mode="adaptive",
         sim_minutes_per_tick=sim_minutes_per_tick,
         signal_mode=signal_mode,
     )
+    if not USING_SYNTHETIC:
+        first_edge = next(iter(ROAD_GRAPH.edges(keys=True)), None)
+        if first_edge is not None:
+            SIM.set_cv_incident_edge(first_edge)
     if autostart:
         SIM.start()
         print(f"[sim] Live traffic simulation started "
@@ -714,7 +718,10 @@ def init_graph(place=None, bbox=None, dist=1500, signal_mode="adaptive",
     # start CV manager in mock mode by default so /api/cv/metrics is available
     try:
         if DEFAULT_CV is not None:
-            DEFAULT_CV.mode = 'mock'
+            DEFAULT_CV.set_mode('mock')
+            DEFAULT_CV.set_traffic_source(
+                lambda: SIM.get_cv_traffic_metrics() if SIM is not None else None
+            )
             DEFAULT_CV.start()
             print('[cv] DEFAULT_CV started (mock)')
     except Exception:
@@ -1160,14 +1167,20 @@ def api_demo_scenario():
                 demo_dst = mid_r * cols + (cols - 1)
                 return jsonify({"status": "triggered", "incident": inc.summary(), "demo_src": demo_src, "demo_dst": demo_dst})
             else:
-                # fallback: pick the first routable edge
-                for u, v, k in ROAD_GRAPH.edges(keys=True):
-                    edge = (u, v, k)
-                    try:
-                        inc = SIM.trigger_incident(edge, incident_type="stalled_vehicle", severity=0.95, confidence=0.2, blocked_fraction=0.9)
-                        return jsonify({"status": "triggered", "incident": inc.summary()})
-                    except Exception:
-                        continue
+                edge = SIM.cv_incident_edge or next(iter(ROAD_GRAPH.edges(keys=True)), None)
+                if edge is not None:
+                    nodes = list(ROAD_GRAPH.nodes)
+                    for demo_src in nodes:
+                        for demo_dst in nodes:
+                            if demo_src == demo_dst:
+                                continue
+                            try:
+                                path = nx.shortest_path(ROAD_GRAPH, demo_src, demo_dst, weight="weight")
+                            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                                continue
+                            if any(a == edge[0] and b == edge[1] for a, b in zip(path[:-1], path[1:])):
+                                inc = SIM.trigger_incident(edge, incident_type="stalled_vehicle", severity=0.95, confidence=0.2, blocked_fraction=0.9)
+                                return jsonify({"status": "triggered", "incident": inc.summary(), "demo_src": demo_src, "demo_dst": demo_dst})
                 return jsonify({"error": "no edge available to trigger incident"}), 500
         except Exception as e:
             return jsonify({"error": str(e)}), 500
@@ -1212,9 +1225,24 @@ def api_cv_metrics():
     try:
         if DEFAULT_CV is None:
             return jsonify({'error': 'cv unavailable', 'metrics': None})
-        return jsonify({'metrics': DEFAULT_CV.get_metrics(), 'mode': DEFAULT_CV.mode})
+        metrics = DEFAULT_CV.get_metrics()
+        return jsonify({**metrics, 'metrics': metrics, 'mode': DEFAULT_CV.mode})
     except Exception as e:
         return jsonify({'error': str(e), 'metrics': None}), 500
+
+
+@app.route('/api/cv/mode', methods=['POST'])
+def api_cv_mode():
+    body = request.get_json(silent=True) or {}
+    mode = body.get('mode', 'mock')
+    if DEFAULT_CV is None:
+        return jsonify({'error': 'cv unavailable'}), 503
+    try:
+        DEFAULT_CV.set_mode(mode)
+        DEFAULT_CV.start()
+        return jsonify({'mode': DEFAULT_CV.mode, 'metrics': DEFAULT_CV.get_metrics()})
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
 
 
 @app.route("/api/simulate/emergency", methods=["POST"])

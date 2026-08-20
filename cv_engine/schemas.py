@@ -35,4 +35,6 @@ class Metrics:
             d['speed_by_class'] = {}
         if d.get('tracks') is None:
             d['tracks'] = {}
+        d['total'] = d['total_vehicles']
+        d['active_tracked'] = d['active_vehicle_count']
         return d

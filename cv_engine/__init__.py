@@ -21,6 +21,18 @@ class CVManager:
         self.metrics = Metrics()
         self._stop = False
         self._thread = None
+        self._traffic_source = None
+
+    def set_mode(self, mode):
+        if mode not in ('auto', 'mock'):
+            raise ValueError('mode must be auto or mock')
+        self.mode = mode
+        if mode == 'mock':
+            self.detector = DummyDetector()
+            self.tracker = MockTracker()
+
+    def set_traffic_source(self, source):
+        self._traffic_source = source
 
         # initialise detector if possible
         if mode == 'mock':
@@ -50,6 +62,11 @@ class CVManager:
         interval = 1.0 / max(1, self.sample_fps)
         while not self._stop:
             try:
+                if self.mode == 'mock':
+                    traffic = self._traffic_source() if self._traffic_source else None
+                    self.metrics = self.mock.next(traffic)
+                    time.sleep(interval)
+                    continue
                 frame = self._get_frame()
                 dets = self.detector.detect(frame)
                 counts_metrics = self.counter.update(dets)

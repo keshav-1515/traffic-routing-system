@@ -816,6 +816,15 @@
         volChange = Math.round(((currentVol - baselineVol) / baselineVol) * 100) + '%';
       }
       obs.innerHTML = `Baseline speed: ${baseline} km/h · Current: ${current} km/h · Speed drop: ${speedDrop}<br>Baseline vol: ${baselineVol} · Current: ${currentVol} · Vol change: ${volChange}<br>Persistence: ${data.cv_persistence_count}`;
+      if (data.active_vehicles > 0 || data.cv_current_volume != null) {
+        fetch('/api/drive/state').then(r => r.json()).then(drive => {
+          if (drive.active && drive.source && drive.target) {
+            window._demo_src = drive.source;
+            window._demo_dst = drive.target;
+            refreshDemoRouteUI();
+          }
+        }).catch(() => {});
+      }
     }).catch(() => {});
   }
 
@@ -826,15 +835,15 @@
   // CV metrics poll
   function refreshCvMetrics() {
     fetch('/api/cv/metrics').then(r => r.json()).then(data => {
-      const m = data && data.metrics ? data.metrics : null;
+      const m = data && (data.metrics || data);
       if (!m) return;
       document.getElementById('cv-cars').textContent = m.cars;
       document.getElementById('cv-motos').textContent = m.motorcycles;
       document.getElementById('cv-buses').textContent = m.buses;
       document.getElementById('cv-trucks').textContent = m.trucks;
-      document.getElementById('cv-total').textContent = m.total_vehicles;
-      document.getElementById('cv-avg-speed').textContent = m.average_speed_kmh ? `${m.average_speed_kmh} km/h` : 'N/A';
-      document.getElementById('cv-active-tracks').textContent = m.active_vehicle_count != null ? m.active_vehicle_count : 'N/A';
+      document.getElementById('cv-total').textContent = m.total_vehicles != null ? m.total_vehicles : 'N/A';
+      document.getElementById('cv-avg-speed').textContent = typeof m.average_speed_kmh === 'number' ? `${m.average_speed_kmh} km/h` : 'N/A';
+      document.getElementById('cv-active-tracks').textContent = m.active_tracked != null ? m.active_tracked : (m.active_vehicle_count != null ? m.active_vehicle_count : 'N/A');
     }).catch(() => {});
   }
   setInterval(refreshCvMetrics, 1000);
@@ -873,8 +882,10 @@
   document.getElementById('route-demo-refresh').addEventListener('click', () => refreshDemoRouteUI());
 
   document.getElementById('cv-toggle-mock').addEventListener('click', () => {
-    fetch('/api/cv/metrics').then(r => r.json()).then(data => {
+    fetch('/api/cv/mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'mock' }) })
+      .then(r => r.json()).then(data => {
       toast('CV mode: ' + (data.mode || 'unknown'));
+      refreshCvMetrics();
     });
   });
 

@@ -40,6 +40,23 @@ def test_sustained_speed_drop_creates_incident():
     assert len(sim.incidents) >= 1
 
 
+def test_cv_incident_uses_configured_real_graph_edge_and_restores_cost():
+    sim = setup_sim()
+    edge = next(iter(sim.G.edges(keys=True)))
+    sim.set_cv_incident_edge(edge)
+    original_weight = sim.G.edges[edge]['weight']
+    build_baseline(sim, speed=30.0, vehicles=5, samples=12)
+    for _ in range(sim.cv_persistence_required + 1):
+        sim.set_external_cv_metrics({'average_speed_kmh': 4.0, 'total_vehicles': 14, 'active_vehicle_count': 14})
+        sim._detect_incidents()
+    assert len(sim.incidents) >= 1
+    assert all(inc.edge == edge for inc in sim.incidents.values())
+    assert sim.G.edges[edge]['weight'] > original_weight
+    incident_id = next(iter(sim.incidents))
+    assert sim.clear_incident(incident_id)
+    assert sim.G.edges[edge]['weight'] == original_weight
+
+
 def test_sustained_drop_plus_volume_increase_strengthens_confidence_and_severity():
     sim = setup_sim()
     build_baseline(sim, speed=30.0, vehicles=4, samples=12)

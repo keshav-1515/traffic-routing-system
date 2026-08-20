@@ -650,6 +650,7 @@ class TrafficSimulation:
         # The single active user-driven "drive from A to B" session, if any
         # (see DriveSession / start_drive / _advance_drive below).
         self.drive: Optional[DriveSession] = None
+        self.cv_incident_edge: Optional[EdgeKey] = None
 
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -1016,6 +1017,11 @@ class TrafficSimulation:
             self._apply_override_now(edge)
             return incident
 
+    def set_cv_incident_edge(self, edge: Optional[EdgeKey]) -> None:
+        """Select the deterministic edge used by the mock-CV demo."""
+        with self._lock:
+            self.cv_incident_edge = edge
+
     def clear_incident(self, incident_id: str) -> bool:
         with self._lock:
             inc = self.incidents.get(incident_id)
@@ -1036,15 +1042,19 @@ class TrafficSimulation:
             data["incident"] = False
             inc.active = False
             self._apply_override_now(edge)
+            if inc.original_weight is not None:
+                data["weight"] = inc.original_weight
             del self.incidents[incident_id]
             return True
 
     def clear_all_incidents(self) -> int:
         with self._lock:
             ids = list(self.incidents.keys())
-            for iid in ids:
-                self.clear_incident(iid)
-            return len(ids)
+        cleared = 0
+        for iid in ids:
+            if self.clear_incident(iid):
+                cleared += 1
+        return cleared
 
     def _detect_incidents(self):
         """Lightweight incident confidence updater using current edge stats."""
@@ -1099,7 +1109,13 @@ class TrafficSimulation:
             free_v = data.get("free_flow_speed_kmh", 30.0)
             congestion = data.get("congestion_score", 0.0)
             # simulation-derived signal
-            sim_speed_drop = max(0.0, (1.0 - speed / max(free_v, 1.0)))
+            speed_value = float(speed or 0.0)
+            free_speed_value = float(free_v or 0.0)
+            if (not math.isfinite(speed_value) or not math.isfinite(free_speed_value)
+                    or (speed_value <= 0.0 and free_speed_value <= 0.0)):
+                sim_speed_drop = 0.0
+            else:
+                sim_speed_drop = max(0.0, (1.0 - speed_value / max(free_speed_value, 1.0)))
             sim_signal = min(1.0, 0.6 * sim_speed_drop + 0.4 * congestion)
 
             # If we do not yet have CV baseline/history, keep original behaviour
@@ -1139,7 +1155,12 @@ class TrafficSimulation:
         # SCAN for new incidents driven by CV + sim signals
         # only consider creating incidents if CV anomaly persisted
         if cv_anomaly:
-            for u, v, k, data in self.G.edges(keys=True, data=True):
+            candidate_edges = self.G.edges(keys=True, data=True)
+            if self.cv_incident_edge is not None:
+                u, v, k = self.cv_incident_edge
+                if v in self.G[u] and k in self.G[u][v]:
+                    candidate_edges = [(u, v, k, self.G[u][v][k])]
+            for u, v, k, data in candidate_edges:
                 edge = (u, v, k)
                 # skip if already an active incident
                 if any((inc.edge == edge for inc in self.incidents.values())):
@@ -1147,7 +1168,13 @@ class TrafficSimulation:
                 speed = data.get("current_speed_kmh", data.get("free_flow_speed_kmh", 30.0))
                 free_v = data.get("free_flow_speed_kmh", 30.0)
                 congestion = data.get("congestion_score", 0.0)
-                sim_speed_drop = max(0.0, (1.0 - speed / max(free_v, 1.0)))
+                speed_value = float(speed or 0.0)
+                free_speed_value = float(free_v or 0.0)
+                if (not math.isfinite(speed_value) or not math.isfinite(free_speed_value)
+                        or (speed_value <= 0.0 and free_speed_value <= 0.0)):
+                    sim_speed_drop = 0.0
+                else:
+                    sim_speed_drop = max(0.0, (1.0 - speed_value / max(free_speed_value, 1.0)))
                 sim_signal = min(1.0, 0.6 * sim_speed_drop + 0.4 * congestion)
                 cv_signal = 0.0
                 if baseline_speed and baseline_speed > 1.0 and current_speed is not None:
@@ -1504,6 +1531,22 @@ class TrafficSimulation:
                         "emergency": veh.is_emergency})
         return out
 
+    def get_cv_traffic_metrics(self) -> Dict:
+        """Return a read-only aggregate for the optional mock CV bridge."""
+        with self._lock:
+            speeds = []
+            for veh in self.vehicles.values():
+                data = self.G.edges[veh.current_edge]
+                speed = float(data.get("current_speed_kmh", data.get("free_flow_speed_kmh", 30.0)) or 0.0)
+                if math.isfinite(speed) and speed > 0:
+                    speeds.append(speed)
+            total = len(self.vehicles) + (1 if self.drive and self.drive.status == "active" else 0)
+            return {
+                "total_vehicles": total,
+                "active_tracked": total,
+                "average_speed_kmh": round(sum(speeds) / len(speeds), 2) if speeds else 0.0,
+            }
+
     # ---- node (intersection) info ---------------------------------------
     def get_node_info(self, node) -> Optional[Dict]:
         if node not in self.G.nodes:
@@ -1741,15 +1784,27 @@ class TrafficSimulation:
     def set_external_cv_metrics(self, metrics: dict) -> None:
         """Accept external CV-derived aggregated metrics (speed, counts)."""
         with self._lock:
-            self.external_cv_metrics = metrics
+            sanitized = dict(metrics or {})
+            try:
+                current_speed = float(sanitized.get('average_speed_kmh', 0.0) or 0.0)
+            except (TypeError, ValueError):
+                current_speed = 0.0
+            if not math.isfinite(current_speed) or current_speed < 0:
+                current_speed = 0.0
+            sanitized['average_speed_kmh'] = current_speed
+            try:
+                sanitized['total_vehicles'] = max(0, int(sanitized.get('total_vehicles', 0) or 0))
+            except (TypeError, ValueError):
+                sanitized['total_vehicles'] = 0
+            self.external_cv_metrics = sanitized
             # append to history (store sim-clock aligned sample)
             try:
                 sample = {
                     'sim_min': self.sim_clock_min,
-                    'timestamp': metrics.get('timestamp', time.time()),
-                    'average_speed_kmh': float(metrics.get('average_speed_kmh', 0.0) or 0.0),
-                    'total_vehicles': int(metrics.get('total_vehicles', 0) or 0),
-                    'active_vehicle_count': int(metrics.get('active_vehicle_count', 0) or 0),
+                    'timestamp': sanitized.get('timestamp', time.time()),
+                    'average_speed_kmh': current_speed,
+                    'total_vehicles': sanitized['total_vehicles'],
+                    'active_vehicle_count': int(sanitized.get('active_vehicle_count', 0) or 0),
                 }
                 self._cv_history.append(sample)
             except Exception:
