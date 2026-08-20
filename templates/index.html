@@ -890,6 +890,30 @@
     `;
   }
 
+  function buildNodePopupHTML(info) {
+    const sig = info.signal;
+    return `
+      <div class="pop">
+        <div class="node-title">Intersection ${info.node}</div>
+        <div class="road-meta">${info.incoming_roads} incoming roads</div>
+        <div class="metric-row">
+          <div class="metric"><div class="num">${info.vehicles_nearby}</div><div class="lab">Vehicles nearby</div></div>
+          <div class="metric"><div class="num">${info.avg_congestion.toFixed(2)}</div><div class="lab">Avg congestion</div></div>
+        </div>
+        ${sig
+          ? `<span class="signal-badge">🚦 ${sig.mode} signal · cycle ${sig.cycle_s}s · green split ${(sig.green_ratio_a*100).toFixed(0)}/${(100-sig.green_ratio_a*100).toFixed(0)}</span>`
+          : '<span class="signal-badge">No traffic signal here</span>'}
+      </div>
+    `;
+  }
+
+  function openNodePopup(nodeId, latlng) {
+    fetch(`/api/simulate/node?id=${nodeId}`).then(res => res.json()).then(info => {
+      if (info.error) return;
+      L.popup({ maxWidth: 260 }).setLatLng(latlng).setContent(buildNodePopupHTML(info)).openOn(map);
+    });
+  }
+
   function refreshOpenEdgePopup() {
     if (!openPopupEdgeKey) return;
     const layer = edgeLayers.get(openPopupEdgeKey);
@@ -1067,14 +1091,14 @@
     const marker = L.divIcon({ className: kind === 'origin' ? 'pick-marker-origin' : 'pick-marker-dest', iconSize: [16, 16], iconAnchor: [8, 16] });
     if (kind === 'origin') {
       if (originMarker) map.removeLayer(originMarker);
-      originMarker = L.marker([node.lat, node.lng], { icon: marker, zIndexOffset: 1000 }).addTo(map);
+      originMarker = L.marker([node.lat, node.lng], { icon: marker, zIndexOffset: 2000 }).addTo(map);
       originNode = node.id;
       document.getElementById('origin-val').textContent = `Node ${node.id}`;
       pickOriginBtn.classList.add('set');
       pickOriginBtn.classList.remove('picking');
     } else {
       if (destMarker) map.removeLayer(destMarker);
-      destMarker = L.marker([node.lat, node.lng], { icon: marker, zIndexOffset: 1000 }).addTo(map);
+      destMarker = L.marker([node.lat, node.lng], { icon: marker, zIndexOffset: 2000 }).addTo(map);
       destNode = node.id;
       document.getElementById('dest-val').textContent = `Node ${node.id}`;
       pickDestBtn.classList.add('set');
@@ -1179,14 +1203,14 @@
     });
     if (mode === 'drive-start') {
       if (driveStartMarker) map.removeLayer(driveStartMarker);
-      driveStartMarker = L.marker([node.lat, node.lng], { icon, zIndexOffset: 1000 }).addTo(map);
+      driveStartMarker = L.marker([node.lat, node.lng], { icon, zIndexOffset: 2000 }).addTo(map);
       driveStartNode = node.id;
       drivePickStartBtn.textContent = `Start: Node ${node.id}`;
       drivePickStartBtn.classList.add('set');
       drivePickStartBtn.classList.remove('picking');
     } else {
       if (driveEndMarker) map.removeLayer(driveEndMarker);
-      driveEndMarker = L.marker([node.lat, node.lng], { icon, zIndexOffset: 1000 }).addTo(map);
+      driveEndMarker = L.marker([node.lat, node.lng], { icon, zIndexOffset: 2000 }).addTo(map);
       driveEndNode = node.id;
       drivePickEndBtn.textContent = `End: Node ${node.id}`;
       drivePickEndBtn.classList.add('set');
@@ -1211,7 +1235,7 @@
       className: '', html: `<div class="car-triangle"></div>`,
       iconSize: [16, 20], iconAnchor: [8, 10],
     });
-    carMarker = L.marker([lat, lng], { icon, interactive: false, zIndexOffset: 2000 }).addTo(map);
+    carMarker = L.marker([lat, lng], { icon, interactive: false, zIndexOffset: 3000 }).addTo(map);
     return carMarker;
   }
 
@@ -1484,25 +1508,7 @@
         badge.classList.add('real');
       }
 
-      // Render Nodes FIRST (placed underneath roads)
-      L.geoJSON(data.nodes, {
-        pointToLayer: (feature, latlng) => {
-          const marker = L.circleMarker(latlng, {
-            radius: 3,
-            fillColor: '#5b5ff0',
-            color: '#ffffff',
-            weight: 1,
-            fillOpacity: 0.6,
-            interactive: false // Non-interactive so roads get 100% of the click priority
-          });
-          const id = String(feature.properties.id ?? feature.id ?? '');
-          nodeLayers.set(id, marker);
-          nodeCoords.push({ id, lat: latlng.lat, lng: latlng.lng });
-          return marker;
-        },
-      }).addTo(map);
-
-      // Render Roads with generous 18px click hitboxes on top
+      // Render Roads with generous 6px width and hover glow
       L.geoJSON(data.edges, {
         style: (feature) => ({
           color: congestionColor(feature.properties.congestion_score || 0),
@@ -1527,7 +1533,6 @@
 
           layer.bindPopup(() => buildEdgePopupHTML(key), { maxWidth: 280 });
 
-          // Mouse hover effect
           layer.on('mouseover', function () {
             this.setStyle({ weight: 10, opacity: 1.0 });
           });
@@ -1542,6 +1547,44 @@
           layer.on('popupopen', () => { openPopupEdgeKey = key; });
           layer.on('popupclose', () => { if (openPopupEdgeKey === key) openPopupEdgeKey = null; });
         }
+      }).addTo(map);
+
+      // Render Interactive Intersection Nodes
+      L.geoJSON(data.nodes, {
+        pointToLayer: (feature, latlng) => {
+          const id = String(feature.properties.id ?? feature.id ?? '');
+          const marker = L.circleMarker(latlng, {
+            radius: 4,
+            fillColor: '#5b5ff0',
+            color: '#ffffff',
+            weight: 1.5,
+            fillOpacity: 0.9,
+            interactive: true,
+            zIndexOffset: 1000
+          });
+
+          marker.on('mouseover', function () {
+            this.setStyle({ radius: 7, fillColor: '#ec4899' });
+          });
+          marker.on('mouseout', function () {
+            this.setStyle({ radius: 4, fillColor: '#5b5ff0' });
+          });
+
+          marker.on('click', (e) => {
+            L.DomEvent.stopPropagation(e);
+            if (pickingMode === 'origin' || pickingMode === 'destination') {
+              setRoutePoint(pickingMode, { id, lat: latlng.lat, lng: latlng.lng });
+            } else if (pickingMode === 'drive-start' || pickingMode === 'drive-end') {
+              setDrivePoint(pickingMode, { id, lat: latlng.lat, lng: latlng.lng });
+            } else {
+              openNodePopup(id, latlng);
+            }
+          });
+
+          nodeLayers.set(id, marker);
+          nodeCoords.push({ id, lat: latlng.lat, lng: latlng.lng });
+          return marker;
+        },
       }).addTo(map);
 
       refreshSimState();
