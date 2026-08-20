@@ -6,7 +6,7 @@
 <title>Urban Traffic Control — Live Digital Twin</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="preconnect" href="https://fonts.gstatic.com" />
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
 <style>
@@ -279,10 +279,7 @@
     border: none; background: var(--panel-2); color: var(--text-dim); font-weight: 600;
   }
 
-  /* ---- vehicle markers ----
-     Deliberately NOT var(--accent) - that's the same indigo used for the
-     intersection/node dots, which made moving vehicles and static nodes
-     visually indistinguishable on the map. */
+  /* ---- vehicle markers ---- */
   .veh-dot {
     width: 6px; height: 6px; border-radius: 50%; background: var(--vehicle-color); border: 1px solid #fff;
     box-shadow: 0 0 3px rgba(var(--vehicle-color-rgb),0.7);
@@ -301,7 +298,7 @@
   .pick-marker-origin { background: #16a34a; }
   .pick-marker-dest { background: #dc2626; }
 
-  /* ---- Drive bar: pick start/end nodes, start/stop drive ---- */
+  /* ---- Drive bar ---- */
   .drivebar {
     flex-shrink: 0; margin: 0 24px 16px; z-index: 500;
     display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
@@ -340,10 +337,10 @@
     border-bottom: 17px solid var(--accent);
     filter: drop-shadow(0 0 4px rgba(var(--accent-rgb),0.6)) drop-shadow(0 1px 2px rgba(23,25,35,0.35));
     transform-origin: 50% 65%;
-    transition: transform 0.15s linear; /* smooths out the per-poll bearing snap */
+    transition: transform 0.15s linear;
   }
 
-  /* ---- Peak-hour toggle (topbar) ---- */
+  /* ---- Peak-hour toggle ---- */
   #peak-toggle {
     pointer-events: auto; font-size: 11px; letter-spacing: 0.3px; text-transform: uppercase;
     background: var(--panel); border: 1px solid var(--school); color: var(--school); font-weight: 700;
@@ -404,7 +401,7 @@
     box-shadow: 0 0 3px rgba(23,25,35,.35);
   }
 
-  /* ---- Leaflet controls, restyled to match the light panel system ---- */
+  /* ---- Leaflet controls ---- */
   .leaflet-bar { border: 1px solid var(--border) !important; border-radius: 10px !important; box-shadow: 0 8px 20px rgba(23,25,35,0.08) !important; overflow: hidden; }
   .leaflet-bar a { background: var(--panel) !important; color: var(--text) !important; border-bottom: 1px solid var(--border) !important; }
   .leaflet-bar a:hover { background: var(--panel-2) !important; color: var(--accent) !important; }
@@ -541,7 +538,6 @@
         <div id="load-gauge"><span id="load-value">–</span></div>
       </div>
     </div>
-
 
     <div class="card">
       <div class="section-label">Congestion legend</div>
@@ -774,11 +770,11 @@
   // ------------------------------------------------------------------
   // Data caches
   // ------------------------------------------------------------------
-  const edgeLayers = new Map();       // "u-v-k" -> leaflet polyline layer
-  const edgeStatic = new Map();       // "u-v-k" -> {highway, lanes, length_m, free_flow_time_min, capacity_veh_per_hr}
-  let edgeLive = {};                  // "u-v-k" -> live state from /api/simulate/state
-  const nodeLayers = new Map();       // node id (string) -> leaflet circle marker
-  const nodeCoords = [];              // [{id, lat, lng}] for nearest-node lookup
+  const edgeLayers = new Map();
+  const edgeStatic = new Map();
+  let edgeLive = {};
+  const nodeLayers = new Map();
+  const nodeCoords = [];
   let openPopupEdgeKey = null;
   let openPopupNodeId = null;
   let reroutePreviewLayer = null;
@@ -786,8 +782,7 @@
   function edgeKey(u, v, k) { return `${u}-${v}-${k}`; }
 
   // ------------------------------------------------------------------
-  // Reroute preview: after block/jam, highlight the path traffic now
-  // takes instead, built from the exact geometry already on the map.
+  // Reroute preview: after block/jam, highlight the path traffic now takes
   // ------------------------------------------------------------------
   function showReroutePreview(u, v, k) {
     fetch(`/api/simulate/reroute_preview?u=${u}&v=${v}&k=${k}`)
@@ -805,8 +800,13 @@
         });
         if (!latlngs.length) return;
         reroutePreviewLayer = L.polyline(latlngs, {
-          color: '#8a5cff', weight: 6, opacity: 0.85, dashArray: '2 10',
-          lineCap: 'round', className: 'reroute-preview',
+          color: '#8a5cff',
+          weight: 6,
+          opacity: 0.85,
+          dashArray: '2 10',
+          lineCap: 'round',
+          className: 'reroute-preview',
+          interactive: false
         }).addTo(map).bindTooltip(
           `Recommended detour · ${data.time_min} min · ${(data.distance_m / 1000).toFixed(2)} km`,
           { sticky: true }
@@ -931,7 +931,7 @@
     else if (action === 'reset') req = postJSON('/api/simulate/reset', { u, v, k });
 
     req.then(() => {
-      refreshSimState(); // pull the immediately-recomputed weight/congestion right away
+      refreshSimState();
       if (action === 'block' || action === 'jam') {
         showReroutePreview(u, v, k);
       } else if (reroutePreviewLayer) {
@@ -962,9 +962,9 @@
   };
 
   // ------------------------------------------------------------------
-  // Camera tab: select a road on the map, upload a clip, apply analysis
+  // Camera tab
   // ------------------------------------------------------------------
-  let camSelectedEdge = null; // {u, v, k}
+  let camSelectedEdge = null;
   function setCamSelectedEdge(u, v, k, label) {
     camSelectedEdge = { u, v, k };
     const chip = document.getElementById('cam-selected-chip');
@@ -995,7 +995,7 @@
   });
 
   // ------------------------------------------------------------------
-  // Demo Vehicles tab: spawn/tick/reset a manually-controlled batch
+  // Demo Vehicles tab
   // ------------------------------------------------------------------
   const demoVehicleMarkers = new Map();
   let demoTickTimer = null;
@@ -1081,9 +1081,9 @@
   }
 
   // ------------------------------------------------------------------
-  // Route tab: pick origin/destination on the map, find optimal route
+  // Route tab
   // ------------------------------------------------------------------
-  let pickingMode = null; // 'origin' | 'destination' | 'drive-start' | 'drive-end' | null
+  let pickingMode = null;
   let originNode = null, destNode = null;
   let driveStartNode = null, driveEndNode = null;
   let originMarker = null, destMarker = null, routeLayer = null;
@@ -1160,7 +1160,7 @@
         }
         if (routeLayer) map.removeLayer(routeLayer);
         const latlngs = data.geometry.coordinates.map(([lng, lat]) => [lat, lng]);
-        routeLayer = L.polyline(latlngs, { color: '#5b5ff0', weight: 6, opacity: 0.95 }).addTo(map);
+        routeLayer = L.polyline(latlngs, { color: '#5b5ff0', weight: 6, opacity: 0.95, interactive: false }).addTo(map);
         map.fitBounds(routeLayer.getBounds(), { padding: [60, 60] });
         resultEl.innerHTML = `
           <div class="stat-row"><span class="k">Distance</span><span class="v">${(data.distance_m / 1000).toFixed(2)} km</span></div>
@@ -1188,7 +1188,7 @@
   });
 
   // ------------------------------------------------------------------
-  // "Drive from A to B" — smooth animated navigation with live rerouting
+  // "Drive from A to B"
   // ------------------------------------------------------------------
   const drivePickStartBtn = document.getElementById('drive-pick-start');
   const drivePickEndBtn = document.getElementById('drive-pick-end');
@@ -1203,11 +1203,6 @@
   let driveAnimHandle = null;
   let lastKnownReroutes = 0;
 
-  // The most recently-fetched server state, plus the wall-clock time (via
-  // performance.now()) it was fetched at. Every animation frame re-derives
-  // "where is the car right now" from this snapshot instead of waiting for
-  // the next poll — this is what makes the motion continuous instead of
-  // jumping once every poll interval.
   let driveSnapshot = null;
   let driveSnapshotFetchedAtMs = 0;
 
@@ -1273,7 +1268,6 @@
     if (tri) tri.style.transform = `rotate(${deg}deg)`;
   }
 
-  // ---- continuous animation loop (requestAnimationFrame) ----------------
   function driveAnimTick() {
     if (!driveActive || !driveSnapshot || !driveSnapshot.current_edge) {
       driveAnimHandle = null;
@@ -1283,10 +1277,6 @@
     const [ulng, ulat] = ce.u_coords;
     const [vlng, vlat] = ce.v_coords;
 
-    // Extrapolate "sim time right now" from wall-clock elapsed since the
-    // snapshot was fetched, using the server's own tick_seconds <->
-    // sim_minutes_per_tick ratio — this is what lets the car keep moving
-    // smoothly between polls instead of only updating once per poll.
     const elapsedMs = performance.now() - driveSnapshotFetchedAtMs;
     const simMinPerRealMs = driveSnapshot.sim_minutes_per_tick / (driveSnapshot.tick_seconds * 1000);
     const estSimNow = driveSnapshot.sim_clock_min + elapsedMs * simMinPerRealMs;
@@ -1307,7 +1297,11 @@
     if (driveRouteLayer) map.removeLayer(driveRouteLayer);
     const latlngs = geoCoords.map(([lng, lat]) => [lat, lng]);
     driveRouteLayer = L.polyline(latlngs, {
-      color: '#00e5ff', weight: 6, opacity: 0.9, dashArray: null,
+      color: '#00e5ff',
+      weight: 6,
+      opacity: 0.9,
+      dashArray: null,
+      interactive: false
     }).addTo(map);
   }
 
@@ -1329,7 +1323,6 @@
       `<span>Rerouted <b>${state.reroute_count}×</b></span>`;
   }
 
-  // ---- server polling: fetches fresh route/edge state, feeds the rAF loop -
   function pollDriveState() {
     fetch('/api/drive/state')
       .then(res => res.json())
@@ -1403,17 +1396,9 @@
   });
 
   // ------------------------------------------------------------------
-  // Live vehicle-flow visualisation (moving dots)
+  // Live vehicle-flow visualisation
   // ------------------------------------------------------------------
-  // Each vehicle's position is extrapolated along its CURRENT ROAD EDGE
-  // using the sim clock, exactly like the drive-car marker (driveAnimTick)
-  // above - never by drawing a straight line between two raw poll
-  // snapshots. That distinction matters: a vehicle can change roads at an
-  // intersection between polls, and lerping raw lat/lng points would cut
-  // a diagonal line straight across open ground instead of following the
-  // turn. Extrapolating along (u_coords -> v_coords, enter_time, exit_time)
-  // keeps every dot mathematically on a road at all times.
-  const vehicleMarkers = new Map(); // id -> { marker, u_coords, v_coords, enter_time_min, exit_time_min }
+  const vehicleMarkers = new Map();
   let vehDensitySelect = document.getElementById('veh-density-select');
   let vehAnimHandle = null;
   let vehSimClockMin = 0, vehTickSeconds = 2.0, vehSimMinutesPerTick = 1.0, vehFetchedAtMs = 0;
@@ -1478,7 +1463,7 @@
   }
 
   // ------------------------------------------------------------------
-  // Live state polling — recolors roads, updates popups, stats, zones
+  // Live state polling
   // ------------------------------------------------------------------
   function applyEdgeState(key, state) {
     edgeLive[key] = state;
@@ -1527,7 +1512,7 @@
   }
 
   // ------------------------------------------------------------------
-  // Load the graph once; live values then layer on top continuously.
+  // Initial Graph Load
   // ------------------------------------------------------------------
   fetch('/api/graph')
     .then(res => res.json())
