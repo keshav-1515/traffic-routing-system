@@ -61,3 +61,24 @@ def test_zero_baseline_metrics_are_finite_and_do_not_create_incident():
     assert state['cv_current_speed_kmh'] == 0
     assert len(sim.incidents) == 0
     assert 'nan' not in str(state).lower()
+
+
+def test_live_mock_initialization_returns_nonzero_metrics():
+    from cv_engine import CVManager
+    manager = CVManager(mode='mock', sample_fps=30)
+    manager.set_mode('mock')
+    manager.start()
+    try:
+        import time
+        deadline = time.time() + 1.0
+        metrics = manager.get_metrics()
+        while metrics['total'] == 0 and time.time() < deadline:
+            time.sleep(0.02)
+            metrics = manager.get_metrics()
+        assert manager.mode == 'mock'
+        assert metrics['cars'] > 0
+        assert metrics['total'] > 0
+        assert metrics['average_speed_kmh'] > 0
+        assert metrics['active_tracked'] > 0
+    finally:
+        manager.stop()

@@ -23,6 +23,16 @@ class CVManager:
         self._thread = None
         self._traffic_source = None
 
+        # Initialise the detector if possible; mock mode stays dependency-free.
+        if self.mode == 'mock':
+            self.detector = DummyDetector()
+        else:
+            try:
+                self.detector = YOLODetector(model_path=model_path, conf_thresh=conf_thresh)
+            except Exception:
+                self.detector = DummyDetector()
+                self.mode = 'mock'
+
     def set_mode(self, mode):
         if mode not in ('auto', 'mock'):
             raise ValueError('mode must be auto or mock')
@@ -33,17 +43,6 @@ class CVManager:
 
     def set_traffic_source(self, source):
         self._traffic_source = source
-
-        # initialise detector if possible
-        if mode == 'mock':
-            self.detector = DummyDetector()
-        else:
-            try:
-                self.detector = YOLODetector(model_path=model_path, conf_thresh=conf_thresh)
-            except Exception:
-                # fallback to mock
-                self.detector = DummyDetector()
-                self.mode = 'mock'
 
     def start(self):
         if self._thread:
