@@ -1,0 +1,1607 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Urban Traffic Control — Live Digital Twin</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<style>
+  :root {
+    --bg: #f2f3f8;
+    --panel: #ffffff;
+    --panel-2: #f5f6fb;
+    --border: #e5e7f0;
+    --text: #171923;
+    --text-dim: #667085;
+    --text-faint: #98a2b3;
+    --accent: #5b5ff0;
+    --accent-rgb: 91, 95, 240;
+    --vehicle-color: #fb923c;
+    --vehicle-color-rgb: 251, 146, 60;
+    --accent-dark: #4640d1;
+    --low: #16a34a;
+    --low-rgb: 22, 163, 74;
+    --mid: #d97706;
+    --mid-rgb: 217, 119, 6;
+    --high: #dc2626;
+    --high-rgb: 220, 38, 38;
+    --hospital: #db2777;
+    --hospital-rgb: 219, 39, 119;
+    --school: #ca8a04;
+    --school-rgb: 202, 138, 4;
+    --emergency: #f43f5e;
+    --emergency-rgb: 244, 63, 94;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+  body { display: flex; overflow: hidden; }
+
+  /* ================= Sidebar ================= */
+  .sidebar {
+    width: 76px; flex-shrink: 0; height: 100%; background: var(--panel);
+    border-right: 1px solid var(--border); display: flex; flex-direction: column;
+    align-items: center; padding: 18px 0; gap: 22px; z-index: 1200;
+  }
+  .sidebar-logo {
+    width: 40px; height: 40px; border-radius: 12px; background: var(--accent); color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 6px 16px rgba(var(--accent-rgb),0.35);
+  }
+  .sidebar-logo svg { width: 20px; height: 20px; }
+  .sidebar-nav { display: flex; flex-direction: column; gap: 8px; flex: 1; }
+  .sidebar-tab {
+    width: 42px; height: 42px; border-radius: 12px; border: none; background: transparent;
+    color: var(--text-faint); display: flex; align-items: center; justify-content: center;
+    cursor: pointer; transition: all .15s;
+  }
+  .sidebar-tab svg { width: 20px; height: 20px; }
+  .sidebar-tab:hover { background: var(--panel-2); color: var(--text-dim); }
+  .sidebar-tab.active { background: rgba(var(--accent-rgb),0.12); color: var(--accent); }
+  .sidebar-bottom { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+  .sidebar-icon-btn {
+    width: 36px; height: 36px; border-radius: 10px; border: 1px solid var(--border); background: var(--panel);
+    display: flex; align-items: center; justify-content: center; cursor: pointer;
+  }
+  .sidebar-icon-btn:hover { border-color: var(--accent); }
+  .sidebar-avatar {
+    width: 36px; height: 36px; border-radius: 50%; background: linear-gradient(135deg, var(--accent), #8b5cf6);
+    color: #fff; font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: center;
+  }
+
+  /* ================= Main column ================= */
+  .main-col { flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; }
+
+  .topheader {
+    flex-shrink: 0; display: flex; align-items: center; justify-content: space-between;
+    padding: 20px 24px 14px; gap: 16px;
+  }
+  .topheader-titles .title { font-weight: 800; font-size: 20px; letter-spacing: -0.2px; color: var(--text); }
+  .topheader-titles .subtitle { font-size: 12.5px; color: var(--text-dim); margin-top: 3px; }
+  .topheader-actions { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+
+  .live-dot {
+    width: 9px; height: 9px; border-radius: 50%; background: var(--low);
+    box-shadow: 0 0 0 3px rgba(var(--low-rgb),0.18);
+    animation: pulse 2.4s ease-in-out infinite;
+  }
+  .live-dot.paused {
+    background: var(--text-faint);
+    box-shadow: 0 0 0 3px rgba(152,162,179,0.18);
+    animation: none;
+  }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 3px rgba(var(--low-rgb),0.18); }
+    50% { box-shadow: 0 0 0 6px rgba(var(--low-rgb),0.06); }
+  }
+
+  /* ================= Content split (list column + map) ================= */
+  .content-split { flex: 1; min-height: 0; display: flex; gap: 16px; padding: 0 24px 24px; }
+
+  #console {
+    width: 380px; flex-shrink: 0; display: flex; flex-direction: column;
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 18px; overflow: hidden;
+    box-shadow: 0 2px 10px rgba(23,25,35,0.04);
+    transition: width .25s ease, opacity .2s ease, margin .25s ease;
+  }
+  #console.collapsed { width: 0; opacity: 0; margin-right: -16px; border-width: 0; pointer-events: none; }
+
+  .console-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 16px; border-bottom: 1px solid var(--border); background: var(--panel); flex-shrink: 0;
+  }
+  .console-head span { font-size: 12px; font-weight: 700; letter-spacing: 0.4px; color: var(--text); text-transform: uppercase; }
+  #console-toggle {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text-dim);
+    border-radius: 8px; width: 26px; height: 26px; cursor: pointer; font-size: 14px;
+  }
+  #console-toggle:hover { color: var(--text); border-color: var(--accent); }
+
+  #show-console {
+    position: fixed; top: 22px; left: 100px; z-index: 1300; display: none;
+    background: var(--panel); border: 1px solid var(--border); color: var(--text-dim);
+    border-radius: 10px; padding: 8px 14px; font-size: 12px; cursor: pointer; font-weight: 600;
+    box-shadow: 0 8px 20px rgba(23,25,35,0.10);
+  }
+  body.console-collapsed #show-console { display: block; }
+
+  .console-body { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; }
+
+  .tabs { display: none; }
+  .tab { cursor: pointer; }
+
+  .panel { display: none; flex-direction: column; gap: 12px; }
+  .panel.active { display: flex; }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    padding: 16px; box-shadow: 0 2px 8px rgba(23,25,35,0.03);
+  }
+  .card .section-label:first-child { margin-top: 0; }
+
+  .stat-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; font-size: 12.5px; }
+  .stat-row .k { color: var(--text-dim); }
+  .stat-row .v { font-weight: 700; color: var(--text); }
+
+  .badge {
+    display: inline-block; margin-top: 8px; font-size: 11px; padding: 4px 10px; border-radius: 20px;
+    border: none; color: var(--text-dim); background: rgba(102,112,133,0.10); font-weight: 600;
+  }
+  .badge.real { color: var(--low); background: rgba(var(--low-rgb),0.12); }
+  .badge.synthetic { color: var(--mid); background: rgba(var(--mid-rgb),0.12); }
+
+  .section-label {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-faint);
+    margin: 4px 0 8px; font-weight: 700;
+  }
+  .legend { margin-top: 0; padding-top: 0; border-top: none; }
+
+  .gauge-wrap { display: flex; align-items: center; gap: 12px; margin-top: 6px; }
+  #load-gauge {
+    --pct: 0;
+    position: relative;
+    width: 56px; height: 56px; border-radius: 50%; flex-shrink: 0;
+    background: conic-gradient(var(--accent) calc(var(--pct) * 1%), #e5e7f0 0);
+    display: flex; align-items: center; justify-content: center;
+  }
+  #load-gauge::before { content: ''; position: absolute; inset: 7px; border-radius: 50%; background: var(--panel-2); }
+  #load-value {
+    position: absolute; inset: 0; z-index: 1;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px; font-weight: 700; color: var(--text);
+  }
+
+  .swatch-row { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim); margin: 3px 0; }
+  .swatch { width: 11px; height: 11px; border-radius: 3px; flex-shrink: 0; }
+
+  /* ---- Route tab ---- */
+  .route-field { margin-bottom: 10px; }
+  .route-field label { display: block; font-size: 11px; color: var(--text-faint); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.4px; font-weight: 700; }
+  .route-pick-btn {
+    width: 100%; padding: 10px; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); font-size: 12.5px; cursor: pointer;
+    display: flex; align-items: center; gap: 8px; text-align: left;
+  }
+  .route-pick-btn .dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+  .route-pick-btn.origin .dot { background: #16a34a; }
+  .route-pick-btn.dest .dot { background: #dc2626; }
+  .route-pick-btn.picking { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; color: var(--accent); }
+  .route-pick-btn .val { flex: 1; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .route-pick-btn.set .val { color: var(--text); }
+
+  #route-find-btn {
+    width: 100%; margin-top: 6px; padding: 11px; border-radius: 10px; border: none;
+    background: var(--accent); color: white; font-weight: 700; font-size: 12.5px; cursor: pointer;
+    box-shadow: 0 4px 12px rgba(var(--accent-rgb),0.28);
+  }
+  #route-find-btn:hover:not(:disabled) { background: var(--accent-dark); }
+  #route-find-btn:disabled { background: #e5e7f0; color: var(--text-faint); cursor: not-allowed; box-shadow: none; }
+  .primary-btn {
+    width: 100%; padding: 11px; border-radius: 10px; border: none;
+    background: var(--accent); color: white; font-weight: 700; font-size: 12.5px; cursor: pointer;
+    box-shadow: 0 4px 12px rgba(var(--accent-rgb),0.28);
+  }
+  .primary-btn:hover:not(:disabled) { background: var(--accent-dark); }
+  .primary-btn:disabled { background: #e5e7f0; color: var(--text-faint); cursor: not-allowed; box-shadow: none; }
+  #route-clear-btn {
+    width: 100%; margin-top: 6px; padding: 9px; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text-dim); font-size: 12px; cursor: pointer;
+  }
+  #route-clear-btn:hover { border-color: var(--accent); color: var(--accent); }
+  #route-result { margin-top: 12px; font-size: 12.5px; }
+  #route-hint { font-size: 11.5px; color: var(--text-faint); margin-top: 8px; line-height: 1.5; }
+
+  /* ---- Zones tab (assigned-zone list) ---- */
+  .zone-item {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 9px 11px; border: 1px solid var(--border); border-radius: 10px; margin-bottom: 8px;
+    background: var(--panel); font-size: 12px;
+  }
+  .zone-item .tag {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; padding: 3px 9px; border-radius: 10px;
+    font-weight: 700;
+  }
+  .tag.hospital { color: var(--hospital); background: rgba(var(--hospital-rgb),0.12); }
+  .tag.school { color: var(--school); background: rgba(var(--school-rgb),0.12); }
+  .tag.emergency { color: var(--emergency); background: rgba(var(--emergency-rgb),0.12); }
+  .zone-item button {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text-dim);
+    border-radius: 7px; font-size: 10.5px; padding: 4px 8px; cursor: pointer;
+  }
+  .zone-item button:hover { color: var(--text); border-color: var(--accent); }
+  .empty-note { color: var(--text-faint); font-size: 12px; line-height: 1.5; }
+
+  /* ---- Leaflet popup theming ---- */
+  .leaflet-popup-content-wrapper {
+    background: var(--panel); color: var(--text); border-radius: 12px;
+    border: 1px solid var(--border); box-shadow: 0 12px 32px rgba(23,25,35,0.14);
+  }
+  .leaflet-popup-tip { background: var(--panel); border: 1px solid var(--border); }
+  .leaflet-popup-content { margin: 12px 14px; font-family: inherit; }
+  .leaflet-popup-close-button { color: var(--text-dim) !important; }
+
+  .pop { min-width: 220px; }
+  .pop .road-name { font-weight: 700; font-size: 13.5px; margin-bottom: 2px; color: var(--text); }
+  .pop .road-meta { font-size: 11.5px; color: var(--text-dim); margin-bottom: 2px; }
+  .pop .metric-row { display: flex; gap: 14px; margin: 8px 0; }
+  .pop .metric { flex: 1; background: var(--panel-2); border-radius: 10px; padding: 8px 10px; }
+  .pop .metric .num { font-size: 15px; font-weight: 700; color: var(--text); }
+  .pop .metric .lab { font-size: 10px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.3px; }
+  .pop .cscore { display: inline-flex; align-items: center; gap: 5px; font-weight: 700; }
+  .pop .cscore .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .pop .zone-pill {
+    display: inline-block; font-size: 10px; margin-top: 6px; padding: 3px 9px; border-radius: 10px;
+    text-transform: uppercase; letter-spacing: 0.3px; font-weight: 700;
+  }
+  .pop .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 10px; }
+  .pop .actions button {
+    padding: 8px 6px; border-radius: 8px; border: 1px solid var(--border); background: var(--panel-2);
+    color: var(--text); font-size: 11.5px; cursor: pointer; font-weight: 600;
+  }
+  .pop .actions button:hover { border-color: var(--accent); color: var(--accent); }
+  .pop .actions button.danger:hover { border-color: var(--high); color: var(--high); }
+  .pop .actions button.good:hover { border-color: var(--low); color: var(--low); }
+  .pop .actions button.warn:hover { border-color: var(--mid); color: var(--mid); }
+  .pop .actions button.full { grid-column: 1 / -1; }
+  .pop .zone-select-row { margin-top: 8px; }
+  .pop .zone-select-row label { font-size: 10.5px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.3px; font-weight: 700; }
+  .pop select {
+    width: 100%; margin-top: 4px; padding: 7px 8px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); font-size: 12px;
+  }
+  .pop .node-title { font-weight: 700; font-size: 13.5px; margin-bottom: 6px; color: var(--text); }
+  .pop .signal-badge {
+    display: inline-block; font-size: 10.5px; padding: 3px 9px; border-radius: 10px; margin-top: 4px;
+    border: none; background: var(--panel-2); color: var(--text-dim); font-weight: 600;
+  }
+
+  /* ---- vehicle markers ----
+     Deliberately NOT var(--accent) - that's the same indigo used for the
+     intersection/node dots, which made moving vehicles and static nodes
+     visually indistinguishable on the map. */
+  .veh-dot {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--vehicle-color); border: 1px solid #fff;
+    box-shadow: 0 0 3px rgba(var(--vehicle-color-rgb),0.7);
+  }
+  .veh-dot.emergency {
+    width: 9px; height: 9px; background: #f43f5e; border: 1px solid #fff;
+    box-shadow: 0 0 6px rgba(244,63,94,0.85);
+    animation: emerg-flash 0.6s ease-in-out infinite;
+  }
+  @keyframes emerg-flash { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  .pick-marker-origin, .pick-marker-dest {
+    width: 16px; height: 16px; border-radius: 50% 50% 50% 0; transform: rotate(-45deg);
+    border: 2px solid white;
+  }
+  .pick-marker-origin { background: #16a34a; }
+  .pick-marker-dest { background: #dc2626; }
+
+  /* ---- Drive bar: pick start/end nodes, start/stop drive ---- */
+  .drivebar {
+    flex-shrink: 0; margin: 0 24px 16px; z-index: 500;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 16px;
+    padding: 12px 14px; box-shadow: 0 2px 10px rgba(23,25,35,0.04);
+    font-size: 12.5px;
+  }
+  .drive-field { display: flex; align-items: center; gap: 6px; }
+  .drive-field .dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+  .drive-field .dot.start { background: var(--low); }
+  .drive-field .dot.end { background: var(--high); }
+  .drivebar button {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 9px; padding: 8px 13px; font-size: 12px; cursor: pointer; font-weight: 600;
+  }
+  .drivebar button:hover { border-color: var(--accent); color: var(--accent); }
+  .drivebar button.picking { border-color: var(--accent); color: var(--accent); box-shadow: 0 0 0 2px rgba(var(--accent-rgb),0.18); }
+  .drivebar button.set { color: var(--text); border-color: rgba(var(--low-rgb),0.5); }
+  #drive-info { margin-right: auto; }
+  .drivebar button#drive-start-btn {
+    background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 700;
+    box-shadow: 0 4px 12px rgba(var(--accent-rgb),0.28);
+  }
+  .drivebar button#drive-start-btn:hover:not(:disabled) { background: var(--accent-dark); }
+  .drivebar button#drive-start-btn:disabled { background: #e5e7f0; border-color: var(--border); color: var(--text-faint); cursor: not-allowed; box-shadow: none; }
+  .drivebar button#drive-stop-btn { background: var(--high); border-color: var(--high); color: #fff; font-weight: 700; }
+  .drivebar button#drive-stop-btn:hover { background: #b91c1c; }
+  #drive-info { display: flex; gap: 12px; font-size: 12px; color: var(--text-dim); }
+  #drive-info b { color: var(--text); }
+  #drive-info .reroute-flash { color: var(--mid); font-weight: 700; }
+
+  .car-triangle {
+    width: 0; height: 0;
+    border-left: 7px solid transparent;
+    border-right: 7px solid transparent;
+    border-bottom: 17px solid var(--accent);
+    filter: drop-shadow(0 0 4px rgba(var(--accent-rgb),0.6)) drop-shadow(0 1px 2px rgba(23,25,35,0.35));
+    transform-origin: 50% 65%;
+    transition: transform 0.15s linear; /* smooths out the per-poll bearing snap */
+  }
+
+  /* ---- Peak-hour toggle (topbar) ---- */
+  #peak-toggle {
+    pointer-events: auto; font-size: 11px; letter-spacing: 0.3px; text-transform: uppercase;
+    background: var(--panel); border: 1px solid var(--school); color: var(--school); font-weight: 700;
+    padding: 6px 12px; border-radius: 14px; cursor: pointer; transition: all .15s;
+    margin-left: auto; box-shadow: 0 2px 8px rgba(23,25,35,0.06);
+  }
+  #peak-toggle.active { background: var(--school); color: #ffffff; border-color: var(--school); font-weight: 700; }
+
+  /* ---- Toast ---- */
+  #toast {
+    position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 1300;
+    background: var(--text); border: 1px solid var(--text); color: #fff;
+    font-size: 12px; padding: 10px 18px; border-radius: 20px; opacity: 0; transition: opacity .25s;
+    pointer-events: none; box-shadow: 0 8px 24px rgba(23,25,35,0.25); max-width: 420px; text-align: center;
+  }
+  #toast.show { opacity: 1; }
+
+  /* ---- Camera tab ---- */
+  .selected-road-chip {
+    border: 1px dashed var(--border); border-radius: 10px; padding: 10px; margin: 8px 0 14px; font-size: 12px;
+    background: var(--panel);
+  }
+  .selected-road-chip.empty { color: var(--text-faint); font-style: italic; text-align: center; }
+  input[type=file] {
+    width: 100%; font-size: 11.5px; color: var(--text-dim); margin-top: 6px;
+  }
+  #cam-status { margin-top: 8px; font-size: 11.5px; color: var(--text-dim); line-height: 1.5; }
+
+  /* ---- Edge popup: congestion slider + what-if ---- */
+  .pop .slider-row { margin-top: 10px; }
+  .pop .slider-row label { font-size: 10.5px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.3px; display: flex; justify-content: space-between; font-weight: 700; }
+  .pop input[type=range] { width: 100%; margin-top: 4px; accent-color: var(--accent); }
+  .pop .whatif-btn {
+    width: 100%; margin-top: 8px; padding: 8px 6px; border-radius: 8px; border: 1px dashed var(--accent);
+    background: rgba(var(--accent-rgb),0.06); color: var(--accent); font-size: 11.5px; cursor: pointer; font-weight: 600;
+  }
+  .pop .whatif-btn:hover { background: rgba(var(--accent-rgb),0.14); }
+
+  /* ---- Vehicles (demo) tab ---- */
+  .btn-row-2 { display: flex; gap: 6px; margin-top: 8px; }
+  .field-row { margin: 10px 0; }
+  .field-row label { display: block; font-size: 11px; color: var(--text-faint); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.4px; font-weight: 700; }
+  .field-row input[type=number] {
+    width: 100%; background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    padding: 8px 10px; border-radius: 8px; font-size: 12.5px;
+  }
+  button.side-btn {
+    flex: 1; padding: 10px; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); font-size: 12px; cursor: pointer; font-weight: 600;
+  }
+  button.side-btn:hover { border-color: var(--accent); color: var(--accent); }
+  button.side-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.side-btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 700; box-shadow: 0 4px 12px rgba(var(--accent-rgb),0.28); }
+  button.side-btn.primary:hover { background: var(--accent-dark); color: #fff; }
+  button.side-btn.danger { border-color: var(--high); color: var(--high); }
+  .demo-veh-dot {
+    width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid rgba(255,255,255,0.95);
+    box-shadow: 0 0 3px rgba(23,25,35,.35);
+  }
+
+  /* ---- Leaflet controls, restyled to match the light panel system ---- */
+  .leaflet-bar { border: 1px solid var(--border) !important; border-radius: 10px !important; box-shadow: 0 8px 20px rgba(23,25,35,0.08) !important; overflow: hidden; }
+  .leaflet-bar a { background: var(--panel) !important; color: var(--text) !important; border-bottom: 1px solid var(--border) !important; }
+  .leaflet-bar a:hover { background: var(--panel-2) !important; color: var(--accent) !important; }
+  .leaflet-control-attribution { background: rgba(255,255,255,0.85) !important; color: var(--text-faint) !important; }
+
+  /* ================= Map column ================= */
+  .map-col {
+    flex: 1; min-width: 0; position: relative; border-radius: 20px; overflow: hidden;
+    border: 1px solid var(--border); box-shadow: 0 4px 18px rgba(23,25,35,0.06);
+  }
+  #map { position: absolute; inset: 0; background: #eceef4; }
+
+  .map-chip {
+    position: absolute; z-index: 500; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 8px 14px; box-shadow: 0 6px 18px rgba(23,25,35,0.10);
+    font-size: 12px; font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 7px;
+  }
+  .map-chip svg { flex-shrink: 0; color: var(--accent); }
+  .map-chip-top { top: 16px; left: 16px; }
+
+  .map-stats-bar {
+    position: absolute; left: 16px; right: 16px; bottom: 16px; z-index: 500;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 16px;
+    box-shadow: 0 8px 24px rgba(23,25,35,0.10);
+    display: flex; align-items: stretch; padding: 12px 8px;
+  }
+  .map-stat {
+    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 3px; padding: 0 10px; border-right: 1px solid var(--border);
+  }
+  .map-stat:last-child { border-right: none; }
+  .map-stat-lab { font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--text-faint); font-weight: 700; }
+  .map-stat-val { font-size: 14px; font-weight: 800; color: var(--text); }
+</style>
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="sidebar-logo" title="Urban Traffic Control">
+    <svg viewBox="0 0 24 24" fill="none"><circle cx="6" cy="6" r="2.4" fill="currentColor"/><circle cx="18" cy="6" r="2.4" fill="currentColor"/><circle cx="12" cy="18" r="2.4" fill="currentColor"/><path d="M6 8.4V12a2 2 0 0 0 2 2h2m4 0h2a2 2 0 0 0 2-2V8.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+  </div>
+
+  <nav class="sidebar-nav" role="tablist">
+    <button class="tab sidebar-tab active" data-tab="network" role="tab" aria-selected="true" title="Network">
+      <svg viewBox="0 0 24 24" fill="none"><rect x="3.5" y="3.5" width="7" height="7" rx="1.8" stroke="currentColor" stroke-width="1.8"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.8" stroke="currentColor" stroke-width="1.8"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.8" stroke="currentColor" stroke-width="1.8"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.8" stroke="currentColor" stroke-width="1.8"/></svg>
+    </button>
+    <button class="tab sidebar-tab" data-tab="route" role="tab" aria-selected="false" title="Route">
+      <svg viewBox="0 0 24 24" fill="none"><circle cx="5.5" cy="6" r="2.2" stroke="currentColor" stroke-width="1.8"/><circle cx="18.5" cy="18" r="2.2" stroke="currentColor" stroke-width="1.8"/><path d="M5.5 8.2V11a3 3 0 0 0 3 3h5a3 3 0 0 1 3 3v0.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-dasharray="2.4 2.4"/></svg>
+    </button>
+    <button class="tab sidebar-tab" data-tab="zones" role="tab" aria-selected="false" title="Zones">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M6 3.5v17" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M6 4.5h10.5c1.4 0 2 1.3 1 2.3l-2.3 2.2 2.3 2.2c1 1 0.4 2.3-1 2.3H6" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+    </button>
+    <button class="tab sidebar-tab" data-tab="camera" role="tab" aria-selected="false" title="Camera">
+      <svg viewBox="0 0 24 24" fill="none"><rect x="3" y="7" width="14" height="11" rx="2.2" stroke="currentColor" stroke-width="1.8"/><path d="M17 10.2l4-2.2v8l-4-2.2" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+    </button>
+    <button class="tab sidebar-tab" data-tab="vehicles" role="tab" aria-selected="false" title="Demo vehicles">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M3.5 15V12l1.8-4.2A2 2 0 0 1 7.1 6.5h9.8a2 2 0 0 1 1.8 1.3L20.5 12v3" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><rect x="2.5" y="12" width="19" height="4.5" rx="1.5" stroke="currentColor" stroke-width="1.8"/><circle cx="7" cy="18.5" r="1.7" fill="currentColor"/><circle cx="17" cy="18.5" r="1.7" fill="currentColor"/></svg>
+    </button>
+  </nav>
+
+  <div class="sidebar-bottom">
+    <button class="sidebar-icon-btn" id="live-dot-btn" title="Click to pause/resume the live simulation">
+      <span class="live-dot" id="live-dot"></span>
+    </button>
+    <div class="sidebar-avatar" title="Urban Traffic Control">U</div>
+  </div>
+</aside>
+
+<div class="main-col">
+  <header class="topheader">
+    <div class="topheader-titles">
+      <div class="title">Urban Traffic Control</div>
+      <div class="subtitle">Explore &amp; manage your city's live network</div>
+    </div>
+    <div class="topheader-actions">
+      <div id="source-badge" class="badge">loading…</div>
+      <button id="peak-toggle" title="City-wide policy: penalize through-traffic on hospital/school/emergency zones even harder">Peak Hour: Off</button>
+    </div>
+  </header>
+
+  <div class="drivebar" id="drivebar">
+    <div class="drive-field">
+      <span class="dot start"></span>
+      <button id="drive-pick-start" title="Click, then click a node on the map">Pick start</button>
+    </div>
+    <div class="drive-field">
+      <span class="dot end"></span>
+      <button id="drive-pick-end" title="Click, then click a node on the map">Pick end</button>
+    </div>
+    <div id="drive-info"></div>
+    <button id="drive-start-btn" disabled>▶ Start Drive</button>
+    <button id="drive-stop-btn" style="display:none;">■ Stop</button>
+  </div>
+
+  <div class="content-split">
+    <div id="console">
+      <div class="console-head">
+        <span>Control Panel</span>
+        <button id="console-toggle" title="Collapse">‹</button>
+      </div>
+      <div class="console-body">
+  <!-- ============ NETWORK TAB ============ -->
+  <div class="panel active" data-panel="network">
+    <div class="card">
+      <div class="section-label">Road graph</div>
+      <div class="stat-row"><span class="k">Nodes</span><span class="v" id="node-count">–</span></div>
+      <div class="stat-row"><span class="k">Road segments</span><span class="v" id="edge-count">–</span></div>
+    </div>
+
+    <div class="card">
+      <div class="section-label">Live simulation</div>
+      <div class="stat-row"><span class="k">Sim clock</span><span class="v" id="sim-clock">–</span></div>
+      <div class="stat-row"><span class="k">Active vehicles</span><span class="v" id="sim-vehicles">–</span></div>
+      <div class="stat-row"><span class="k">Avg travel time</span><span class="v" id="sim-avgtime">–</span></div>
+      <div class="stat-row"><span class="k">Roads under override</span><span class="v" id="sim-overrides">–</span></div>
+      <div class="stat-row"><span class="k">Peak-hour surge</span><span class="v" id="sim-surge">–</span></div>
+      <div class="stat-row"><span class="k">CO₂ emitted</span><span class="v" id="sim-co2">–</span></div>
+      <div class="route-field" style="margin-top:10px;margin-bottom:0;">
+        <label style="display:block;font-size:11px;color:var(--text-faint);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.4px;font-weight:700;">Vehicle markers on map</label>
+        <select id="veh-density-select" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);font-size:12.5px;">
+          <option value="1">Show all</option>
+          <option value="25">1 per 25 vehicles</option>
+          <option value="50" selected>1 per 50 vehicles</option>
+          <option value="100">1 per 100 vehicles</option>
+          <option value="200">1 per 200 vehicles</option>
+          <option value="500">1 per 500 vehicles</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-label">Network load</div>
+      <div class="gauge-wrap">
+        <div id="load-gauge"><span id="load-value">–</span></div>
+      </div>
+    </div>
+
+
+    <div class="card">
+      <div class="section-label">Congestion legend</div>
+      <div class="swatch-row"><span class="swatch" style="background:#16a34a"></span> Free-flowing (&lt; 0.4)</div>
+      <div class="swatch-row"><span class="swatch" style="background:#d97706"></span> Moderate (0.4 – 0.7)</div>
+      <div class="swatch-row"><span class="swatch" style="background:#dc2626"></span> Congested (≥ 0.7)</div>
+      <div class="swatch-row"><span class="swatch" style="background:var(--vehicle-color);border-radius:50%"></span> Moving vehicle</div>
+      <div class="swatch-row"><span class="swatch" style="background:#f43f5e;border-radius:50%"></span> Emergency vehicle</div>
+    </div>
+
+    <div class="card">
+      <div class="section-label">How to use this map</div>
+      <div class="empty-note">
+        Click any road or intersection to open its live control panel —
+        block it, boost its flow, simulate a peak-hour surge, or tag it
+        as a hospital / school / emergency zone. Blocking or jamming a
+        road highlights the detour traffic will now take.
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ ROUTE TAB ============ -->
+  <div class="panel" data-panel="route">
+    <div class="card">
+      <div class="section-label">Find optimal route</div>
+      <div class="route-field">
+        <label>Origin</label>
+        <button class="route-pick-btn origin" id="pick-origin-btn">
+          <span class="dot"></span><span class="val" id="origin-val">Click to pick on map</span>
+        </button>
+      </div>
+      <div class="route-field">
+        <label>Destination</label>
+        <button class="route-pick-btn dest" id="pick-dest-btn">
+          <span class="dot"></span><span class="val" id="dest-val">Click to pick on map</span>
+        </button>
+      </div>
+      <button id="route-find-btn" disabled>Find optimal route</button>
+      <button id="route-clear-btn">Clear route</button>
+      <div id="route-result"></div>
+    </div>
+    <div class="card">
+      <div id="route-hint">
+        The route minimises a blend of distance and live citywide congestion
+        (travel time under the network's current BPR/signal-delay weights) —
+        not just the shortest path.
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ ZONES TAB ============ -->
+  <div class="panel" data-panel="zones">
+    <div class="card">
+      <div class="section-label">Assigned special zones</div>
+      <div id="zone-list"><div class="empty-note">No roads tagged yet. Click a road on the map and use "Assign zone" to mark it as a hospital, school, or emergency zone.</div></div>
+    </div>
+  </div>
+
+  <!-- ============ CAMERA TAB ============ -->
+  <div class="panel" data-panel="camera">
+    <div class="card">
+      <div class="section-label">Traffic-camera analysis</div>
+      <div class="empty-note">
+        Click a road on the map to select it, then upload a short clip. The
+        server runs OpenCV background-subtraction + contour counting to
+        estimate a live congestion score from actual vehicle motion, and
+        applies it to that road for ~10 simulated minutes — the same
+        "camera → congestion" IoT path a real CCTV/YOLOv8 pipeline would use.
+      </div>
+    </div>
+    <div class="card">
+      <div class="section-label">Selected road</div>
+      <div class="selected-road-chip empty" id="cam-selected-chip">No road selected — click one on the map</div>
+      <label style="font-size:11px;color:var(--text-faint);text-transform:uppercase;letter-spacing:0.4px;font-weight:700;">Video clip</label>
+      <input type="file" id="cam-video-input" accept="video/*" disabled />
+      <button id="cam-analyze-btn" class="primary-btn" style="margin-top:10px;" disabled>Analyze &amp; apply</button>
+      <div id="cam-status"></div>
+    </div>
+  </div>
+
+  <!-- ============ DEMO VEHICLES TAB ============ -->
+  <div class="panel" data-panel="vehicles">
+    <div class="card">
+      <div class="section-label">Demo vehicle batch</div>
+      <div class="empty-note">
+        Spawn a small tracked batch of vehicles and step them forward
+        manually — separate from the always-on background simulation above.
+        They still route against the live, congestion-aware graph, so they
+        react to any block/jam/boost/zone change exactly like real traffic.
+      </div>
+      <div class="field-row">
+        <label>Vehicles to spawn</label>
+        <input type="number" id="demo-spawn-count" value="15" min="1" max="200" />
+      </div>
+      <div class="btn-row-2">
+        <button class="side-btn primary" id="demo-btn-spawn">Spawn</button>
+        <button class="side-btn danger" id="demo-btn-reset">Reset</button>
+      </div>
+      <div class="btn-row-2">
+        <button class="side-btn" id="demo-btn-start">Start ticking</button>
+        <button class="side-btn" id="demo-btn-stop" disabled>Stop</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="section-label">Status</div>
+      <div class="stat-row"><span class="k">Tick</span><span class="v" id="demo-tick">0</span></div>
+      <div class="stat-row"><span class="k">Active</span><span class="v" id="demo-active">0</span></div>
+      <div class="stat-row"><span class="k">Arrived</span><span class="v" id="demo-arrived">0</span></div>
+    </div>
+  </div>
+      </div>
+    </div>
+
+    <div class="map-col">
+      <div id="map"></div>
+      <div class="map-chip map-chip-top" id="map-chip-top">
+        <svg viewBox="0 0 24 24" fill="none" width="14" height="14"><rect x="3.5" y="3.5" width="7" height="7" rx="1.6" stroke="currentColor" stroke-width="1.8"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.6" stroke="currentColor" stroke-width="1.8"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.6" stroke="currentColor" stroke-width="1.8"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.6" stroke="currentColor" stroke-width="1.8"/></svg>
+        <span><span id="map-chip-nodecount">–</span> nodes · <span id="map-chip-edgecount">–</span> segments</span>
+      </div>
+      <div class="map-stats-bar">
+        <div class="map-stat">
+          <span class="map-stat-lab">Sim clock</span>
+          <span class="map-stat-val" id="map-chip-clock">–</span>
+        </div>
+        <div class="map-stat">
+          <span class="map-stat-lab">Active vehicles</span>
+          <span class="map-stat-val" id="map-chip-vehicles">–</span>
+        </div>
+        <div class="map-stat">
+          <span class="map-stat-lab">Avg travel time</span>
+          <span class="map-stat-val" id="map-chip-avgtime">–</span>
+        </div>
+        <div class="map-stat">
+          <span class="map-stat-lab">CO₂ emitted</span>
+          <span class="map-stat-val" id="map-chip-co2">–</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<button id="show-console">Show panel</button>
+<div id="toast"></div>
+
+<script>
+  const map = L.map('map', { zoomControl: true }).setView([{{ center_lat }}, {{ center_lng }}], 16);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+    attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+    subdomains: 'abcd', maxZoom: 20,
+  }).addTo(map);
+
+  function congestionColor(score) {
+    if (score < 0.4) return '#16a34a';
+    if (score < 0.7) return '#d97706';
+    return '#dc2626';
+  }
+  function congestionLabel(score) {
+    if (score < 0.4) return 'Free-flowing';
+    if (score < 0.7) return 'Moderate';
+    return 'Congested';
+  }
+  const ZONE_COLORS = { hospital: '#db2777', school: '#ca8a04', emergency: '#f43f5e' };
+
+  function toast(msg) {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.classList.add('show');
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => el.classList.remove('show'), 3200);
+  }
+
+  // ------------------------------------------------------------------
+  // Peak-hour policy toggle (city-wide zone routing penalty)
+  // ------------------------------------------------------------------
+  let peakHourActive = false;
+  const peakBtn = document.getElementById('peak-toggle');
+  function updatePeakUI() {
+    peakBtn.textContent = 'Peak Hour: ' + (peakHourActive ? 'On' : 'Off');
+    peakBtn.classList.toggle('active', peakHourActive);
+  }
+  peakBtn.addEventListener('click', () => {
+    postJSON('/api/scenario/peak_hour', { enabled: !peakHourActive }).then(r => {
+      peakHourActive = r.peak_hour_active;
+      updatePeakUI();
+      toast('Peak hour ' + (peakHourActive ? 'enabled — zone roads penalized harder' : 'disabled'));
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // Console UI: tabs + collapse toggle
+  // ------------------------------------------------------------------
+  const consoleEl = document.getElementById('console');
+  function setConsoleCollapsed(collapsed) {
+    consoleEl.classList.toggle('collapsed', collapsed);
+    document.body.classList.toggle('console-collapsed', collapsed);
+    setTimeout(() => map.invalidateSize(), 260);
+  }
+  document.getElementById('console-toggle').addEventListener('click', () => setConsoleCollapsed(true));
+  document.getElementById('show-console').addEventListener('click', () => setConsoleCollapsed(false));
+  window.addEventListener('resize', () => map.invalidateSize());
+
+  document.querySelectorAll('.tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach((t) => { t.classList.remove('active'); t.setAttribute('aria-selected', 'false'); });
+      document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'));
+      tab.classList.add('active');
+      tab.setAttribute('aria-selected', 'true');
+      document.querySelector(`.panel[data-panel="${tab.dataset.tab}"]`).classList.add('active');
+    });
+  });
+
+  let simRunning = true;
+  const liveDot = document.getElementById('live-dot');
+  document.getElementById('live-dot-btn').addEventListener('click', () => {
+    const endpoint = simRunning ? '/api/simulate/stop' : '/api/simulate/start';
+    fetch(endpoint, { method: 'POST' }).then(res => res.json()).then(data => {
+      simRunning = data.running;
+      liveDot.classList.toggle('paused', !simRunning);
+    });
+  });
+
+  function postJSON(url, body) {
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    }).then(res => res.json());
+  }
+
+  // ------------------------------------------------------------------
+  // Data caches
+  // ------------------------------------------------------------------
+  const edgeLayers = new Map();       // "u-v-k" -> leaflet polyline layer
+  const edgeStatic = new Map();       // "u-v-k" -> {highway, lanes, length_m, free_flow_time_min, capacity_veh_per_hr}
+  let edgeLive = {};                  // "u-v-k" -> live state from /api/simulate/state
+  const nodeLayers = new Map();       // node id (string) -> leaflet circle marker
+  const nodeCoords = [];              // [{id, lat, lng}] for nearest-node lookup
+  let openPopupEdgeKey = null;
+  let openPopupNodeId = null;
+  let reroutePreviewLayer = null;
+
+  function edgeKey(u, v, k) { return `${u}-${v}-${k}`; }
+
+  // ------------------------------------------------------------------
+  // Reroute preview: after block/jam, highlight the path traffic now
+  // takes instead, built from the exact geometry already on the map.
+  // ------------------------------------------------------------------
+  function showReroutePreview(u, v, k) {
+    fetch(`/api/simulate/reroute_preview?u=${u}&v=${v}&k=${k}`)
+      .then(res => res.json())
+      .then(data => {
+        if (reroutePreviewLayer) { map.removeLayer(reroutePreviewLayer); reroutePreviewLayer = null; }
+        if (data.error || data.unchanged) return;
+        let latlngs = [];
+        data.edges.forEach(([eu, ev, ek]) => {
+          const layer = edgeLayers.get(edgeKey(eu, ev, ek));
+          if (layer) {
+            const seg = layer.getLatLngs();
+            latlngs = latlngs.concat(seg);
+          }
+        });
+        if (!latlngs.length) return;
+        reroutePreviewLayer = L.polyline(latlngs, {
+          color: '#8a5cff', weight: 6, opacity: 0.85, dashArray: '2 10',
+          lineCap: 'round', className: 'reroute-preview',
+        }).addTo(map).bindTooltip(
+          `Recommended detour · ${data.time_min} min · ${(data.distance_m / 1000).toFixed(2)} km`,
+          { sticky: true }
+        );
+        setTimeout(() => {
+          if (reroutePreviewLayer) { map.removeLayer(reroutePreviewLayer); reroutePreviewLayer = null; }
+        }, 15000);
+      })
+      .catch(() => {});
+  }
+
+  // ------------------------------------------------------------------
+  // Zones tab: live list of assigned zones
+  // ------------------------------------------------------------------
+  function refreshZoneList(overrides) {
+    const zoned = (overrides || []).filter(o => o.zone_type);
+    const el = document.getElementById('zone-list');
+    if (!zoned.length) {
+      el.innerHTML = '<div class="empty-note">No roads tagged yet. Click a road on the map and use "Assign zone" to mark it as a hospital, school, or emergency zone.</div>';
+      return;
+    }
+    el.innerHTML = zoned.map(o => {
+      const [u, v, k] = o.edge;
+      return `<div class="zone-item">
+        <div><span class="tag ${o.zone_type}">${o.zone_type}</span><div style="margin-top:4px;color:var(--text-dim)">${u} → ${v}</div></div>
+        <button onclick="clearZone('${u}','${v}','${k}')">Clear</button>
+      </div>`;
+    }).join('');
+  }
+  window.clearZone = function (u, v, k) {
+    postJSON('/api/simulate/zone', { u, v, k, zone_type: null }).then(() => {
+      if (openPopupEdgeKey === edgeKey(u, v, k)) refreshOpenEdgePopup();
+    });
+  };
+
+  // ------------------------------------------------------------------
+  // Edge popup
+  // ------------------------------------------------------------------
+  function buildEdgePopupHTML(key) {
+    const s = edgeStatic.get(key);
+    const live = edgeLive[key];
+    if (!s || !live) return '<div class="pop">Loading…</div>';
+    const [u, v, k] = key.split('-');
+    const score = live.congestion_score ?? 0;
+    const color = congestionColor(Math.min(score, 1));
+    const zonePill = live.zone_type
+      ? `<span class="zone-pill" style="background:${ZONE_COLORS[live.zone_type]}22;color:${ZONE_COLORS[live.zone_type]};border:1px solid ${ZONE_COLORS[live.zone_type]}55">${live.zone_type} zone</span>`
+      : '';
+    const blockLabel = live.closed ? 'Reopen road' : 'Block road';
+    const blockClass = live.closed ? 'good' : 'danger';
+    const boosted = live.capacity_factor > 1.01;
+    const jammed = live.capacity_factor < 0.99 && !live.closed;
+
+    return `
+      <div class="pop">
+        <div class="road-name">${s.highway.replace(/_/g, ' ')}</div>
+        <div class="road-meta">Lanes ${s.lanes} · ${s.length_m} m · free-flow ${s.free_flow_time_min} min</div>
+        ${zonePill}
+        ${live.closed ? '<div class="road-meta" style="color:var(--high);margin-top:4px;">⛔ Currently blocked</div>' : ''}
+        ${jammed ? `<div class="road-meta" style="color:var(--mid);margin-top:4px;">⚠ Reduced capacity (${live.override_label || 'jam'})</div>` : ''}
+        ${boosted ? `<div class="road-meta" style="color:var(--low);margin-top:4px;">⬆ Boosted capacity (${live.override_label || 'flow boost'})</div>` : ''}
+
+        <div class="metric-row">
+          <div class="metric">
+            <div class="num">${live.current_volume ?? '–'}</div>
+            <div class="lab">Vehicles now</div>
+          </div>
+          <div class="metric">
+            <div class="num">${live.current_speed_kmh ?? '–'}</div>
+            <div class="lab">km/h</div>
+          </div>
+        </div>
+        <div class="cscore"><span class="dot" style="background:${color}"></span>${congestionLabel(score)} · score ${score.toFixed(2)}</div>
+        <div class="road-meta">Flow ≈ ${live.flow_veh_per_hr ?? '–'} veh/hr</div>
+
+        <div class="actions">
+          <button class="${blockClass}" onclick="edgeAction('${u}','${v}','${k}','${live.closed ? 'unblock' : 'block'}')">${blockLabel}</button>
+          <button class="warn" onclick="edgeAction('${u}','${v}','${k}','jam')">Traffic jam</button>
+          <button class="good" onclick="edgeAction('${u}','${v}','${k}','boost')">Increase flow</button>
+          <button onclick="edgeAction('${u}','${v}','${k}','surge')">Peak-hour surge</button>
+          <button class="full" onclick="edgeAction('${u}','${v}','${k}','reset')">Reset segment</button>
+        </div>
+
+        <div class="zone-select-row">
+          <label>Assign zone</label>
+          <select onchange="edgeZoneChange('${u}','${v}','${k}', this.value)">
+            <option value="" ${!live.zone_type ? 'selected' : ''}>None</option>
+            <option value="hospital" ${live.zone_type === 'hospital' ? 'selected' : ''}>Hospital zone</option>
+            <option value="school" ${live.zone_type === 'school' ? 'selected' : ''}>School zone</option>
+            <option value="emergency" ${live.zone_type === 'emergency' ? 'selected' : ''}>Emergency zone</option>
+          </select>
+        </div>
+
+        <div class="slider-row">
+          <label>Set congestion manually <span id="cong-slider-val-${u}-${v}-${k}">${score.toFixed(2)}</span></label>
+          <input type="range" min="0" max="1" step="0.05" value="${score}"
+                 oninput="document.getElementById('cong-slider-val-${u}-${v}-${k}').textContent = parseFloat(this.value).toFixed(2)"
+                 onchange="edgeSetCongestion('${u}','${v}','${k}', this.value)" />
+        </div>
+
+        <button class="whatif-btn" onclick="edgeWhatIf('${u}','${v}','${k}')">Run what-if: close this road (Frank-Wolfe)</button>
+      </div>
+    `;
+  }
+
+  function refreshOpenEdgePopup() {
+    if (!openPopupEdgeKey) return;
+    const layer = edgeLayers.get(openPopupEdgeKey);
+    if (layer && layer.getPopup() && layer.isPopupOpen()) {
+      layer.setPopupContent(buildEdgePopupHTML(openPopupEdgeKey));
+    }
+  }
+
+  window.edgeAction = function (u, v, k, action) {
+    const key = edgeKey(u, v, k);
+    let req;
+    if (action === 'block') req = postJSON('/api/simulate/closure', { u, v, k, closed: true });
+    else if (action === 'unblock') req = postJSON('/api/simulate/closure', { u, v, k, closed: false });
+    else if (action === 'jam') req = postJSON('/api/simulate/jam', { u, v, k, duration_min: 15, capacity_factor: 0.3 });
+    else if (action === 'boost') req = postJSON('/api/simulate/boost', { u, v, k, duration_min: 15, capacity_factor: 1.7 });
+    else if (action === 'surge') req = postJSON('/api/simulate/peak_surge', { u, v, k, duration_min: 25, intensity: 2.8 });
+    else if (action === 'reset') req = postJSON('/api/simulate/reset', { u, v, k });
+
+    req.then(() => {
+      refreshSimState(); // pull the immediately-recomputed weight/congestion right away
+      if (action === 'block' || action === 'jam') {
+        showReroutePreview(u, v, k);
+      } else if (reroutePreviewLayer) {
+        map.removeLayer(reroutePreviewLayer); reroutePreviewLayer = null;
+      }
+    });
+  };
+
+  window.edgeZoneChange = function (u, v, k, zoneType) {
+    postJSON('/api/simulate/zone', { u, v, k, zone_type: zoneType || null }).then(() => refreshSimState());
+  };
+
+  window.edgeSetCongestion = function (u, v, k, score) {
+    postJSON('/api/edge/congestion', { u, v, k, congestion_score: parseFloat(score) }).then(() => {
+      toast('Congestion manually set — overrides live measurement for a while');
+      refreshSimState();
+    });
+  };
+
+  window.edgeWhatIf = function (u, v, k) {
+    toast('Running Frank-Wolfe counterfactual…');
+    postJSON('/api/whatif', { closures: [[u, v, k]] }).then(data => {
+      if (data.error) { toast(data.error); return; }
+      const pct = data.network_delay_change_pct;
+      const dir = pct >= 0 ? 'increase' : 'decrease';
+      toast(`What-if: closing this road would ${dir} total city-wide travel time by ${Math.abs(pct)}%`);
+    });
+  };
+
+  // ------------------------------------------------------------------
+  // Camera tab: select a road on the map, upload a clip, apply analysis
+  // ------------------------------------------------------------------
+  let camSelectedEdge = null; // {u, v, k}
+  function setCamSelectedEdge(u, v, k, label) {
+    camSelectedEdge = { u, v, k };
+    const chip = document.getElementById('cam-selected-chip');
+    chip.classList.remove('empty');
+    chip.textContent = `${label || 'Road'} · ${u} → ${v}`;
+    document.getElementById('cam-video-input').disabled = false;
+    document.getElementById('cam-analyze-btn').disabled = false;
+  }
+  document.getElementById('cam-analyze-btn').addEventListener('click', () => {
+    const input = document.getElementById('cam-video-input');
+    if (!camSelectedEdge || !input.files.length) { toast('Select a road and a video first'); return; }
+    const fd = new FormData();
+    fd.append('video', input.files[0]);
+    fd.append('u', camSelectedEdge.u);
+    fd.append('v', camSelectedEdge.v);
+    fd.append('k', camSelectedEdge.k);
+    const statusEl = document.getElementById('cam-status');
+    statusEl.textContent = 'Analyzing footage…';
+    fetch('/api/traffic/video', { method: 'POST', body: fd })
+      .then(res => res.json())
+      .then(result => {
+        if (result.error) { statusEl.textContent = 'Error: ' + result.error; return; }
+        statusEl.textContent = `${result.method} — avg ${result.avg_moving_objects} moving objects/frame → congestion ${result.estimated_congestion_score} (applied for ~10 sim-min)`;
+        toast('Camera analysis applied to road');
+        refreshSimState();
+      })
+      .catch(() => { statusEl.textContent = 'Upload failed'; });
+  });
+
+  // ------------------------------------------------------------------
+  // Demo Vehicles tab: spawn/tick/reset a manually-controlled batch
+  // ------------------------------------------------------------------
+  const demoVehicleMarkers = new Map();
+  let demoTickTimer = null;
+
+  function refreshDemoSimState() {
+    fetch('/api/simulation/state').then(res => res.json()).then(state => {
+      document.getElementById('demo-tick').textContent = state.tick;
+      document.getElementById('demo-active').textContent = state.active;
+      document.getElementById('demo-arrived').textContent = state.arrived;
+      const seen = new Set();
+      state.vehicles.forEach(v => {
+        seen.add(v.id);
+        if (demoVehicleMarkers.has(v.id)) {
+          demoVehicleMarkers.get(v.id).setLatLng([v.lat, v.lng]);
+        } else {
+          const icon = L.divIcon({ className: '', html: `<div class="demo-veh-dot" style="background:${v.color}"></div>`, iconSize: [8, 8] });
+          demoVehicleMarkers.set(v.id, L.marker([v.lat, v.lng], { icon, interactive: false }).addTo(map));
+        }
+      });
+      for (const [id, marker] of demoVehicleMarkers) {
+        if (!seen.has(id)) { map.removeLayer(marker); demoVehicleMarkers.delete(id); }
+      }
+    });
+  }
+
+  document.getElementById('demo-btn-spawn').addEventListener('click', () => {
+    const count = parseInt(document.getElementById('demo-spawn-count').value, 10) || 10;
+    postJSON('/api/simulation/spawn', { count }).then(r => {
+      toast(`Spawned ${r.spawned} demo vehicles`);
+      refreshDemoSimState();
+    });
+  });
+
+  document.getElementById('demo-btn-start').addEventListener('click', () => {
+    if (demoTickTimer) return;
+    document.getElementById('demo-btn-start').disabled = true;
+    document.getElementById('demo-btn-stop').disabled = false;
+    demoTickTimer = setInterval(() => {
+      postJSON('/api/simulation/tick', { dt_min: 0.5 }).then(refreshDemoSimState);
+    }, 1200);
+  });
+
+  document.getElementById('demo-btn-stop').addEventListener('click', () => {
+    clearInterval(demoTickTimer); demoTickTimer = null;
+    document.getElementById('demo-btn-start').disabled = false;
+    document.getElementById('demo-btn-stop').disabled = true;
+  });
+
+  document.getElementById('demo-btn-reset').addEventListener('click', () => {
+    postJSON('/api/simulation/reset', {}).then(() => {
+      for (const marker of demoVehicleMarkers.values()) map.removeLayer(marker);
+      demoVehicleMarkers.clear();
+      refreshDemoSimState();
+      toast('Demo vehicle batch reset');
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // Node popup
+  // ------------------------------------------------------------------
+  function buildNodePopupHTML(info) {
+    const sig = info.signal;
+    return `
+      <div class="pop">
+        <div class="node-title">Intersection ${info.node}</div>
+        <div class="road-meta">${info.incoming_roads} incoming roads</div>
+        <div class="metric-row">
+          <div class="metric"><div class="num">${info.vehicles_nearby}</div><div class="lab">Vehicles nearby</div></div>
+          <div class="metric"><div class="num">${info.avg_congestion.toFixed(2)}</div><div class="lab">Avg congestion</div></div>
+        </div>
+        ${sig
+          ? `<span class="signal-badge">🚦 ${sig.mode} signal · cycle ${sig.cycle_s}s · green split ${(sig.green_ratio_a*100).toFixed(0)}/${(100-sig.green_ratio_a*100).toFixed(0)}</span>`
+          : '<span class="signal-badge">No traffic signal here</span>'}
+      </div>
+    `;
+  }
+
+  function openNodePopup(nodeId, latlng) {
+    fetch(`/api/simulate/node?id=${nodeId}`).then(res => res.json()).then(info => {
+      if (info.error) return;
+      L.popup({ maxWidth: 260 }).setLatLng(latlng).setContent(buildNodePopupHTML(info)).openOn(map);
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // Route tab: pick origin/destination on the map, find optimal route
+  // ------------------------------------------------------------------
+  let pickingMode = null; // 'origin' | 'destination' | 'drive-start' | 'drive-end' | null
+  let originNode = null, destNode = null;
+  let driveStartNode = null, driveEndNode = null;
+  let originMarker = null, destMarker = null, routeLayer = null;
+
+  const pickOriginBtn = document.getElementById('pick-origin-btn');
+  const pickDestBtn = document.getElementById('pick-dest-btn');
+  const findBtn = document.getElementById('route-find-btn');
+
+  pickOriginBtn.addEventListener('click', () => {
+    pickingMode = pickingMode === 'origin' ? null : 'origin';
+    pickOriginBtn.classList.toggle('picking', pickingMode === 'origin');
+    pickDestBtn.classList.remove('picking');
+  });
+  pickDestBtn.addEventListener('click', () => {
+    pickingMode = pickingMode === 'destination' ? null : 'destination';
+    pickDestBtn.classList.toggle('picking', pickingMode === 'destination');
+    pickOriginBtn.classList.remove('picking');
+  });
+
+  function nearestNode(latlng) {
+    let best = null, bestDist = Infinity;
+    for (const n of nodeCoords) {
+      const d = (n.lat - latlng.lat) ** 2 + (n.lng - latlng.lng) ** 2;
+      if (d < bestDist) { bestDist = d; best = n; }
+    }
+    return best;
+  }
+
+  function setRoutePoint(kind, node) {
+    const marker = L.divIcon({ className: kind === 'origin' ? 'pick-marker-origin' : 'pick-marker-dest', iconSize: [16, 16], iconAnchor: [8, 16] });
+    if (kind === 'origin') {
+      if (originMarker) map.removeLayer(originMarker);
+      originMarker = L.marker([node.lat, node.lng], { icon: marker }).addTo(map);
+      originNode = node.id;
+      document.getElementById('origin-val').textContent = `Node ${node.id}`;
+      pickOriginBtn.classList.add('set');
+      pickOriginBtn.classList.remove('picking');
+    } else {
+      if (destMarker) map.removeLayer(destMarker);
+      destMarker = L.marker([node.lat, node.lng], { icon: marker }).addTo(map);
+      destNode = node.id;
+      document.getElementById('dest-val').textContent = `Node ${node.id}`;
+      pickDestBtn.classList.add('set');
+      pickDestBtn.classList.remove('picking');
+    }
+    pickingMode = null;
+    findBtn.disabled = !(originNode && destNode);
+  }
+
+  map.on('click', (e) => {
+    if (!pickingMode) return;
+    const node = nearestNode(e.latlng);
+    if (!node) return;
+    if (pickingMode === 'origin' || pickingMode === 'destination') {
+      setRoutePoint(pickingMode, node);
+    } else if (pickingMode === 'drive-start' || pickingMode === 'drive-end') {
+      setDrivePoint(pickingMode, node);
+    }
+  });
+
+  findBtn.addEventListener('click', () => {
+    if (!originNode || !destNode) return;
+    findBtn.disabled = true;
+    findBtn.textContent = 'Finding optimal route…';
+    fetch(`/api/route?source=${originNode}&target=${destNode}&by=time`)
+      .then(res => res.json())
+      .then(data => {
+        findBtn.disabled = false;
+        findBtn.textContent = 'Find optimal route';
+        const resultEl = document.getElementById('route-result');
+        if (data.error) {
+          resultEl.innerHTML = `<div class="empty-note">${data.error}</div>`;
+          return;
+        }
+        if (routeLayer) map.removeLayer(routeLayer);
+        const latlngs = data.geometry.coordinates.map(([lng, lat]) => [lat, lng]);
+        routeLayer = L.polyline(latlngs, { color: '#5b5ff0', weight: 6, opacity: 0.95 }).addTo(map);
+        map.fitBounds(routeLayer.getBounds(), { padding: [60, 60] });
+        resultEl.innerHTML = `
+          <div class="stat-row"><span class="k">Distance</span><span class="v">${(data.distance_m / 1000).toFixed(2)} km</span></div>
+          <div class="stat-row"><span class="k">Est. travel time</span><span class="v">${data.time_min} min</span></div>
+          <div class="stat-row"><span class="k">Road segments</span><span class="v">${data.geometry.coordinates.length - 1}</span></div>
+        `;
+      })
+      .catch(() => {
+        findBtn.disabled = false;
+        findBtn.textContent = 'Find optimal route';
+      });
+  });
+
+  document.getElementById('route-clear-btn').addEventListener('click', () => {
+    if (originMarker) { map.removeLayer(originMarker); originMarker = null; }
+    if (destMarker) { map.removeLayer(destMarker); destMarker = null; }
+    if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; }
+    originNode = destNode = null; pickingMode = null;
+    document.getElementById('origin-val').textContent = 'Click to pick on map';
+    document.getElementById('dest-val').textContent = 'Click to pick on map';
+    pickOriginBtn.classList.remove('set', 'picking');
+    pickDestBtn.classList.remove('set', 'picking');
+    findBtn.disabled = true;
+    document.getElementById('route-result').innerHTML = '';
+  });
+
+  // ------------------------------------------------------------------
+  // "Drive from A to B" — smooth animated navigation with live rerouting
+  // ------------------------------------------------------------------
+  const drivePickStartBtn = document.getElementById('drive-pick-start');
+  const drivePickEndBtn = document.getElementById('drive-pick-end');
+  const driveStartBtn = document.getElementById('drive-start-btn');
+  const driveStopBtn = document.getElementById('drive-stop-btn');
+  const driveInfoEl = document.getElementById('drive-info');
+
+  let driveStartMarker = null, driveEndMarker = null, driveRouteLayer = null;
+  let carMarker = null;
+  let driveActive = false;
+  let drivePollTimer = null;
+  let driveAnimHandle = null;
+  let lastKnownReroutes = 0;
+
+  // The most recently-fetched server state, plus the wall-clock time (via
+  // performance.now()) it was fetched at. Every animation frame re-derives
+  // "where is the car right now" from this snapshot instead of waiting for
+  // the next poll — this is what makes the motion continuous instead of
+  // jumping once every poll interval.
+  let driveSnapshot = null;
+  let driveSnapshotFetchedAtMs = 0;
+
+  drivePickStartBtn.addEventListener('click', () => {
+    pickingMode = pickingMode === 'drive-start' ? null : 'drive-start';
+    drivePickStartBtn.classList.toggle('picking', pickingMode === 'drive-start');
+    drivePickEndBtn.classList.remove('picking');
+  });
+  drivePickEndBtn.addEventListener('click', () => {
+    pickingMode = pickingMode === 'drive-end' ? null : 'drive-end';
+    drivePickEndBtn.classList.toggle('picking', pickingMode === 'drive-end');
+    drivePickStartBtn.classList.remove('picking');
+  });
+
+  function setDrivePoint(mode, node) {
+    const icon = L.divIcon({
+      className: '',
+      html: `<div style="width:14px;height:14px;border-radius:50%;background:${mode === 'drive-start' ? '#16a34a' : '#dc2626'};border:2px solid #fff;box-shadow:0 0 6px rgba(23,25,35,0.4);"></div>`,
+      iconSize: [14, 14], iconAnchor: [7, 7],
+    });
+    if (mode === 'drive-start') {
+      if (driveStartMarker) map.removeLayer(driveStartMarker);
+      driveStartMarker = L.marker([node.lat, node.lng], { icon }).addTo(map);
+      driveStartNode = node.id;
+      drivePickStartBtn.textContent = `Start: Node ${node.id}`;
+      drivePickStartBtn.classList.add('set');
+      drivePickStartBtn.classList.remove('picking');
+    } else {
+      if (driveEndMarker) map.removeLayer(driveEndMarker);
+      driveEndMarker = L.marker([node.lat, node.lng], { icon }).addTo(map);
+      driveEndNode = node.id;
+      drivePickEndBtn.textContent = `End: Node ${node.id}`;
+      drivePickEndBtn.classList.add('set');
+      drivePickEndBtn.classList.remove('picking');
+    }
+    pickingMode = null;
+    driveStartBtn.disabled = !(driveStartNode && driveEndNode) || driveActive;
+  }
+
+  function bearingDeg(lat1, lng1, lat2, lng2) {
+    const toRad = d => d * Math.PI / 180;
+    const dLng = toRad(lng2 - lng1);
+    const y = Math.sin(dLng) * Math.cos(toRad(lat2));
+    const x = Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) -
+              Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLng);
+    return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+  }
+
+  function ensureCarMarker(lat, lng) {
+    if (carMarker) return carMarker;
+    const icon = L.divIcon({
+      className: '', html: `<div class="car-triangle"></div>`,
+      iconSize: [16, 18], iconAnchor: [8, 10],
+    });
+    carMarker = L.marker([lat, lng], { icon, interactive: false, zIndexOffset: 1000 }).addTo(map);
+    return carMarker;
+  }
+
+  function setCarBearing(deg) {
+    if (!carMarker) return;
+    const el = carMarker.getElement();
+    const tri = el && el.querySelector('.car-triangle');
+    if (tri) tri.style.transform = `rotate(${deg}deg)`;
+  }
+
+  // ---- continuous animation loop (requestAnimationFrame) ----------------
+  function driveAnimTick() {
+    if (!driveActive || !driveSnapshot || !driveSnapshot.current_edge) {
+      driveAnimHandle = null;
+      return;
+    }
+    const ce = driveSnapshot.current_edge;
+    const [ulng, ulat] = ce.u_coords;
+    const [vlng, vlat] = ce.v_coords;
+
+    // Extrapolate "sim time right now" from wall-clock elapsed since the
+    // snapshot was fetched, using the server's own tick_seconds <->
+    // sim_minutes_per_tick ratio — this is what lets the car keep moving
+    // smoothly between polls instead of only updating once per poll.
+    const elapsedMs = performance.now() - driveSnapshotFetchedAtMs;
+    const simMinPerRealMs = driveSnapshot.sim_minutes_per_tick / (driveSnapshot.tick_seconds * 1000);
+    const estSimNow = driveSnapshot.sim_clock_min + elapsedMs * simMinPerRealMs;
+
+    const span = Math.max(ce.exit_time_min - ce.enter_time_min, 1e-6);
+    const frac = Math.min(Math.max((estSimNow - ce.enter_time_min) / span, 0), 1);
+
+    const lat = ulat + (vlat - ulat) * frac;
+    const lng = ulng + (vlng - ulng) * frac;
+
+    ensureCarMarker(lat, lng).setLatLng([lat, lng]);
+    setCarBearing(bearingDeg(ulat, ulng, vlat, vlng));
+
+    driveAnimHandle = requestAnimationFrame(driveAnimTick);
+  }
+
+  function renderDriveRoute(geoCoords) {
+    if (driveRouteLayer) map.removeLayer(driveRouteLayer);
+    const latlngs = geoCoords.map(([lng, lat]) => [lat, lng]);
+    driveRouteLayer = L.polyline(latlngs, {
+      color: '#00e5ff', weight: 6, opacity: 0.9, dashArray: null,
+    }).addTo(map);
+  }
+
+  function updateDriveInfo(state) {
+    if (state.reroute_count > lastKnownReroutes) {
+      driveInfoEl.innerHTML = `<span class="reroute-flash">↻ Rerouted (road ahead changed)</span>`;
+      setTimeout(() => renderDriveInfoNormal(state), 1800);
+    } else {
+      renderDriveInfoNormal(state);
+    }
+    lastKnownReroutes = state.reroute_count;
+  }
+
+  function renderDriveInfoNormal(state) {
+    const km = (state.distance_remaining_m / 1000).toFixed(2);
+    driveInfoEl.innerHTML =
+      `<span>ETA <b>${state.eta_min.toFixed(1)} min</b></span>` +
+      `<span>${km} km left</span>` +
+      `<span>Rerouted <b>${state.reroute_count}×</b></span>`;
+  }
+
+  // ---- server polling: fetches fresh route/edge state, feeds the rAF loop -
+  function pollDriveState() {
+    fetch('/api/drive/state')
+      .then(res => res.json())
+      .then(state => {
+        if (!state.active) {
+          finishDrive(state.status === 'arrived' ? 'Arrived!' : 'No route available — stopped.');
+          return;
+        }
+        driveSnapshot = state;
+        driveSnapshotFetchedAtMs = performance.now();
+        renderDriveRoute(state.route_geometry.coordinates);
+        updateDriveInfo(state);
+        if (!driveAnimHandle) driveAnimHandle = requestAnimationFrame(driveAnimTick);
+      })
+      .catch(() => {});
+  }
+
+  function finishDrive(message) {
+    driveActive = false;
+    if (drivePollTimer) { clearInterval(drivePollTimer); drivePollTimer = null; }
+    if (driveAnimHandle) { cancelAnimationFrame(driveAnimHandle); driveAnimHandle = null; }
+    driveInfoEl.innerHTML = `<b>${message}</b>`;
+    driveStartBtn.style.display = '';
+    driveStopBtn.style.display = 'none';
+    driveStartBtn.disabled = !(driveStartNode && driveEndNode);
+    setTimeout(() => {
+      if (driveActive) return;
+      driveInfoEl.innerHTML = '';
+      if (carMarker) { map.removeLayer(carMarker); carMarker = null; }
+      if (driveRouteLayer) { map.removeLayer(driveRouteLayer); driveRouteLayer = null; }
+    }, 4000);
+  }
+
+  driveStartBtn.addEventListener('click', () => {
+    if (!driveStartNode || !driveEndNode) return;
+    driveStartBtn.disabled = true;
+    driveStartBtn.textContent = 'Routing…';
+    fetch('/api/drive/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: driveStartNode, target: driveEndNode }),
+    })
+      .then(res => res.json())
+      .then(state => {
+        driveStartBtn.textContent = '▶ Start Drive';
+        if (state.error) {
+          driveInfoEl.innerHTML = `<span>${state.error}</span>`;
+          driveStartBtn.disabled = false;
+          return;
+        }
+        driveActive = true;
+        lastKnownReroutes = 0;
+        driveStartBtn.style.display = 'none';
+        driveStopBtn.style.display = '';
+        driveSnapshot = state;
+        driveSnapshotFetchedAtMs = performance.now();
+        if (state.route_geometry) renderDriveRoute(state.route_geometry.coordinates);
+        if (state.eta_min != null) renderDriveInfoNormal(state);
+        if (!driveAnimHandle) driveAnimHandle = requestAnimationFrame(driveAnimTick);
+        drivePollTimer = setInterval(pollDriveState, 1000);
+      })
+      .catch(() => {
+        driveStartBtn.textContent = '▶ Start Drive';
+        driveStartBtn.disabled = false;
+      });
+  });
+
+  driveStopBtn.addEventListener('click', () => {
+    fetch('/api/drive/stop', { method: 'POST' }).then(() => finishDrive('Stopped.'));
+    if (carMarker) { map.removeLayer(carMarker); carMarker = null; }
+    if (driveRouteLayer) { map.removeLayer(driveRouteLayer); driveRouteLayer = null; }
+  });
+
+  // ------------------------------------------------------------------
+  // Live vehicle-flow visualisation (moving dots)
+  // ------------------------------------------------------------------
+  // Each vehicle's position is extrapolated along its CURRENT ROAD EDGE
+  // using the sim clock, exactly like the drive-car marker (driveAnimTick)
+  // above - never by drawing a straight line between two raw poll
+  // snapshots. That distinction matters: a vehicle can change roads at an
+  // intersection between polls, and lerping raw lat/lng points would cut
+  // a diagonal line straight across open ground instead of following the
+  // turn. Extrapolating along (u_coords -> v_coords, enter_time, exit_time)
+  // keeps every dot mathematically on a road at all times.
+  const vehicleMarkers = new Map(); // id -> { marker, u_coords, v_coords, enter_time_min, exit_time_min }
+  let vehDensitySelect = document.getElementById('veh-density-select');
+  let vehAnimHandle = null;
+  let vehSimClockMin = 0, vehTickSeconds = 2.0, vehSimMinutesPerTick = 1.0, vehFetchedAtMs = 0;
+
+  function vehicleSampleEvery() {
+    return vehDensitySelect ? parseInt(vehDensitySelect.value, 10) || 1 : 50;
+  }
+
+  function refreshVehicles() {
+    const sampleEvery = vehicleSampleEvery();
+    fetch(`/api/simulate/vehicles?limit=350&sample_every=${sampleEvery}`)
+      .then(res => res.json())
+      .then(data => {
+        vehSimClockMin = data.sim_clock_min;
+        vehTickSeconds = data.tick_seconds;
+        vehSimMinutesPerTick = data.sim_minutes_per_tick;
+        vehFetchedAtMs = performance.now();
+
+        const seen = new Set();
+        data.vehicles.forEach(v => {
+          seen.add(v.id);
+          let entry = vehicleMarkers.get(v.id);
+          if (!entry) {
+            const icon = L.divIcon({ className: '', html: `<div class="veh-dot${v.emergency ? ' emergency' : ''}"></div>`, iconSize: [8, 8] });
+            const [ulng, ulat] = v.u_coords;
+            const marker = L.marker([ulat, ulng], { icon, interactive: false }).addTo(map);
+            entry = { marker };
+            vehicleMarkers.set(v.id, entry);
+          }
+          entry.u_coords = v.u_coords;
+          entry.v_coords = v.v_coords;
+          entry.enter_time_min = v.enter_time_min;
+          entry.exit_time_min = v.exit_time_min;
+        });
+        for (const [id, entry] of vehicleMarkers) {
+          if (!seen.has(id)) { map.removeLayer(entry.marker); vehicleMarkers.delete(id); }
+        }
+        if (!vehAnimHandle) vehAnimHandle = requestAnimationFrame(vehicleAnimTick);
+      })
+      .catch(() => {});
+  }
+
+  function vehicleAnimTick() {
+    const elapsedMs = performance.now() - vehFetchedAtMs;
+    const simMinPerRealMs = vehSimMinutesPerTick / (vehTickSeconds * 1000);
+    const estSimNow = vehSimClockMin + elapsedMs * simMinPerRealMs;
+
+    for (const entry of vehicleMarkers.values()) {
+      const [ulng, ulat] = entry.u_coords;
+      const [vlng, vlat] = entry.v_coords;
+      const span = Math.max(entry.exit_time_min - entry.enter_time_min, 1e-6);
+      const frac = Math.min(Math.max((estSimNow - entry.enter_time_min) / span, 0), 1);
+      const lat = ulat + (vlat - ulat) * frac;
+      const lng = ulng + (vlng - ulng) * frac;
+      entry.marker.setLatLng([lat, lng]);
+    }
+    vehAnimHandle = vehicleMarkers.size ? requestAnimationFrame(vehicleAnimTick) : null;
+  }
+
+  if (vehDensitySelect) {
+    vehDensitySelect.addEventListener('change', refreshVehicles);
+  }
+
+  // ------------------------------------------------------------------
+  // Live state polling — recolors roads, updates popups, stats, zones
+  // ------------------------------------------------------------------
+  function applyEdgeState(key, state) {
+    edgeLive[key] = state;
+    const layer = edgeLayers.get(key);
+    if (!layer) return;
+    layer.setStyle({
+      color: state.closed ? '#9aa1b8' : congestionColor(Math.min(state.congestion_score, 1)),
+      opacity: state.closed ? 0.5 : 0.85,
+      dashArray: state.closed ? '2 6' : (state.incident ? '6 4' : null),
+    });
+  }
+
+  function refreshSimState() {
+    fetch('/api/simulate/state')
+      .then(res => res.json())
+      .then(data => {
+        simRunning = data.running;
+        liveDot.classList.toggle('paused', !simRunning);
+
+        peakHourActive = data.peak_hour_active;
+        updatePeakUI();
+
+        document.getElementById('sim-clock').textContent = data.sim_day_hhmm;
+        document.getElementById('sim-vehicles').textContent = data.active_vehicles;
+        document.getElementById('sim-avgtime').textContent = data.avg_travel_time_min != null ? `${data.avg_travel_time_min} min` : '–';
+        document.getElementById('sim-overrides').textContent = data.active_overrides.length;
+        document.getElementById('sim-surge').textContent = data.peak_surge_active ? 'Active' : 'Off';
+        document.getElementById('sim-co2').textContent = `${data.total_co2_kg} kg`;
+
+        document.getElementById('map-chip-clock').textContent = data.sim_day_hhmm;
+        document.getElementById('map-chip-vehicles').textContent = data.active_vehicles;
+        document.getElementById('map-chip-avgtime').textContent = data.avg_travel_time_min != null ? `${data.avg_travel_time_min} min` : '–';
+        document.getElementById('map-chip-co2').textContent = `${data.total_co2_kg} kg`;
+
+        const avgPct = Math.round(Math.min(data.avg_network_load, 1) * 100);
+        document.getElementById('load-gauge').style.setProperty('--pct', avgPct);
+        document.getElementById('load-value').textContent = `${avgPct}%`;
+
+        for (const [key, state] of Object.entries(data.edges)) {
+          applyEdgeState(key, state);
+        }
+        refreshOpenEdgePopup();
+        refreshZoneList(data.active_overrides);
+      })
+      .catch(err => console.error('simulate/state poll failed', err));
+  }
+
+  // ------------------------------------------------------------------
+  // Load the graph once; live values then layer on top continuously.
+  // ------------------------------------------------------------------
+  fetch('/api/graph')
+    .then(res => res.json())
+    .then(data => {
+      document.getElementById('node-count').textContent = data.node_count;
+      document.getElementById('edge-count').textContent = data.edge_count;
+      document.getElementById('map-chip-nodecount').textContent = data.node_count;
+      document.getElementById('map-chip-edgecount').textContent = data.edge_count;
+      const badge = document.getElementById('source-badge');
+      if (data.using_synthetic) {
+        badge.textContent = 'Synthetic grid (offline mode)';
+        badge.classList.add('synthetic');
+      } else {
+        badge.textContent = 'Real OpenStreetMap data';
+        badge.classList.add('real');
+      }
+
+      L.geoJSON(data.edges, {
+        style: (feature) => ({
+          color: congestionColor(feature.properties.congestion_score || 0),
+          weight: 4,
+          opacity: 0.85,
+        }),
+        onEachFeature: (feature, layer) => {
+          const p = feature.properties;
+          const key = edgeKey(p.u, p.v, p.k);
+          edgeLayers.set(key, layer);
+          edgeStatic.set(key, {
+            highway: p.highway, lanes: p.lanes, length_m: p.length_m,
+            free_flow_time_min: p.free_flow_time_min, capacity_veh_per_hr: p.capacity_veh_per_hr,
+          });
+          edgeLive[key] = {
+            congestion_score: p.congestion_score, current_speed_kmh: p.current_speed_kmh,
+            current_volume: p.current_volume, flow_veh_per_hr: null, closed: false,
+            capacity_factor: 1.0, zone_type: p.zone_type, incident: p.incident, override_label: '',
+          };
+          layer.bindPopup(() => buildEdgePopupHTML(key), { maxWidth: 280 });
+          layer.on('click', () => { openPopupEdgeKey = key; setCamSelectedEdge(p.u, p.v, p.k, p.highway); });
+          layer.on('popupopen', () => { openPopupEdgeKey = key; });
+          layer.on('popupclose', () => { if (openPopupEdgeKey === key) openPopupEdgeKey = null; });
+        }
+      }).addTo(map);
+
+      L.geoJSON(data.nodes, {
+        pointToLayer: (feature, latlng) => {
+          const marker = L.circleMarker(latlng, {
+            radius: 4, fillColor: '#5b5ff0', color: '#ffffff', weight: 1.5, fillOpacity: 0.95,
+          });
+          const id = String(feature.properties.id ?? feature.id ?? '');
+          nodeLayers.set(id, marker);
+          nodeCoords.push({ id, lat: latlng.lat, lng: latlng.lng });
+          marker.on('click', () => {
+            if (pickingMode === 'origin' || pickingMode === 'destination') {
+              setRoutePoint(pickingMode, { id, lat: latlng.lat, lng: latlng.lng });
+            } else if (pickingMode === 'drive-start' || pickingMode === 'drive-end') {
+              setDrivePoint(pickingMode, { id, lat: latlng.lat, lng: latlng.lng });
+            } else {
+              openNodePopup(id, latlng);
+            }
+          });
+          return marker;
+        },
+      }).addTo(map);
+
+      refreshSimState();
+      refreshVehicles();
+      refreshDemoSimState();
+      setInterval(refreshSimState, 3000);
+      setInterval(refreshVehicles, 1500);
+    })
+    .catch(err => {
+      document.getElementById('source-badge').textContent = 'Failed to load graph';
+      console.error(err);
+    });
+</script>
+</body>
+</html>
